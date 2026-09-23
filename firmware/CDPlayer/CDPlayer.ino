@@ -2,7 +2,7 @@
 //
 // Talks to cd_player.py on the host. Sends: STOP, PLAY_BUTTON (pause toggle, or
 // "play" from STANDBY), NEXT/PREV (track skip), POT:<0-100> (volume), PONG.
-// Receives: STANDBY:, PLAY:, PLAY_STATUS:, VU:<16 levels>, LR:<left>,<right>, PING.
+// Receives: STANDBY:, PLAY:, PLAY_STATUS:, VU:<64 levels>, LR:<left>,<right>, PING.
 //
 // STOP never ejects: the host locks the drive at startup and the disc is lifted
 // out by hand. The STOP button (GPIO14), HOME during playback, and a long-press
@@ -39,11 +39,15 @@
 #define SAVER_FRAME_MS     90
 #define PING_TIMEOUT_MS    30000 // no message from the host this long -> DISCONNECTED screen
 
-#define VU_BARS            16    // must match the host's VU_BARS
+#define VU_BARS            64    // must match the host's VU_BARS (128px / 64 = 2px pitch: 1px bar + 1px gap)
 #define VU_TIMEOUT_MS      1200  // no VU: frame this long -> fall back to the text screen
 #define VU_ENTRY_DELAY_MS  10000 // text screen this long after playback starts, then bars
 #define VU_RESUME_DELAY_MS 7000  // ...and this long after any input during PLAY
 #define VU_TOP_MARGIN      16    // px of headroom above the tallest bar
+#define VIZ_FRAME_MS       33    // bars redraw at ~30fps, independent of when host frames arrive
+#define BAR_RELEASE_S      0.06f // bar fall time constant (attack is instant)
+#define PEAK_HOLD_S        0.28f // a peak cap hangs this long before falling
+#define PEAK_GRAVITY       200.0f // px/s^2 the cap accelerates downward once released
 
 // Stereo level meters: two chained 1x8 WS2812B sticks (LEFT = pixels 0-7, RIGHT = 8-15).
 // Powered from the ESP32's USB 5V, so brightness and current are capped hard.
@@ -76,7 +80,12 @@ bool isPaused = false;       // the screensaver may only take over PLAY while pa
 
 // Spectrum visualizer: the host streams "VU:v0,v1,...". While frames keep
 // arriving PLAY shows bars; VU_TIMEOUT_MS after they stop it falls back to text.
-uint8_t vuLevel[VU_BARS];
+uint8_t vuLevel[VU_BARS];    // latest host targets 0-63
+float barH[VU_BARS];           // smoothed bar height in px
+unsigned long lastVizAt = 0;
+float peakH[VU_BARS];          // peak cap height in px above the baseline
+float peakVel[VU_BARS];        // its current fall speed
+float peakHold[VU_BARS];       // seconds left to hang before it starts falling
 bool visualizerActive = false;
 unsigned long lastVuAt = 0;
 unsigned long vuSuppressUntil = 0;   // bars withheld (text shown) until millis() reaches this
@@ -237,21 +246,38 @@ void drawDisconnected() {
   display.display();
 }
 
-// Full-width spectrum bars, no header, capped by VU_TOP_MARGIN. Falls back to
-// drawPlay() once VU: frames stop (see VU_TIMEOUT_MS in loop()).
+// Full-width spectrum: 64 thin bars (1px wide, 2px pitch) with a peak cap on each that jumps to
+// the bar's highest point, hangs briefly, then falls under gravity until the bar catches it.
+// No header. Falls back to drawPlay() once VU: frames stop (see VU_TIMEOUT_MS in loop()).
 void drawPlayVisualizer() {
   uiState = UI_PLAY;
   returnToStandbyAt = 0;
   if (!displayOk) return;
   display.clearDisplay();
-  const int gap = 2;
   const int maxH = SCREEN_HEIGHT - VU_TOP_MARGIN;
-  const int barW = (SCREEN_WIDTH - gap * (VU_BARS - 1)) / VU_BARS;
-  int x = (SCREEN_WIDTH - (barW * VU_BARS + gap * (VU_BARS - 1))) / 2;
+  const int pitch = SCREEN_WIDTH / VU_BARS;
+  unsigned long now = millis();
+  float dt = min((now - lastVizAt) / 1000.0f, 0.1f);
+  lastVizAt = now;
+  float k = 1.0f - expf(-dt / BAR_RELEASE_S);
   for (int i = 0; i < VU_BARS; i++) {
-    int h = map(vuLevel[i], 0, 63, 0, maxH);
-    if (h > 0) display.fillRect(x, SCREEN_HEIGHT - h, barW, h, SSD1306_WHITE);
-    x += barW + gap;
+    float t = vuLevel[i] * maxH / 63.0f;
+    barH[i] = t > barH[i] ? t : barH[i] + (t - barH[i]) * k;
+    if (barH[i] >= peakH[i]) {
+      peakH[i] = barH[i];
+      peakVel[i] = 0;
+      peakHold[i] = PEAK_HOLD_S;
+    } else if (peakHold[i] > 0) {
+      peakHold[i] -= dt;
+    } else {
+      peakVel[i] += PEAK_GRAVITY * dt;
+      peakH[i] -= peakVel[i] * dt;
+      if (peakH[i] < barH[i]) peakH[i] = barH[i];
+    }
+    int h = (int)(barH[i] + 0.5f);
+    int x = i * pitch;
+    if (h > 0) display.drawFastVLine(x, SCREEN_HEIGHT - h, h, SSD1306_WHITE);
+    if (peakH[i] >= 1) display.drawPixel(x, SCREEN_HEIGHT - (int)(peakH[i] + 0.5f) - 2, SSD1306_WHITE);   // 1px gap above the bar
   }
   display.display();
 }
@@ -349,18 +375,15 @@ void parseMessage(String msg) {
   }
 
   if (msg.startsWith("VU:")) {
-    // Arrives ~15x/sec: no wakeDisplay()/RCV echo (would draw stale bars / spam the log).
+    // Arrives ~30x/sec: no wakeDisplay()/RCV echo (would draw stale bars / spam the log).
     lastMsgTime = millis();
-    String rest = msg.substring(3);
-    for (int i = 0; i < VU_BARS; i++) vuLevel[i] = 0;
     bool anyNonzero = false;
-    for (int i = 0; i < VU_BARS && rest.length() > 0; i++) {
-      int comma = rest.indexOf(',');
-      String tok = (comma < 0) ? rest : rest.substring(0, comma);
-      vuLevel[i] = (uint8_t)constrain(tok.toInt(), 0, 63);
-      if (vuLevel[i] > 0) anyNonzero = true;
-      if (comma < 0) break;
-      rest = rest.substring(comma + 1);
+    const char* p = msg.c_str() + 3;   // one char per bar: level = char - '0'
+    for (int i = 0; i < VU_BARS; i++) {
+      int c = *p ? *p++ - '0' : 0;   // constrain() is a macro: never pass it *p++
+      uint8_t v = (uint8_t)constrain(c, 0, 63);
+      vuLevel[i] = v;
+      if (v) anyNonzero = true;
     }
     if (anyNonzero) vuSeenReal = true;
     // Liveness (visualizerActive/lastVuAt) updates on EVERY frame, zero or not:
@@ -371,10 +394,7 @@ void parseMessage(String msg) {
     lastInputTime = millis();
     // Only redraw bars once a real (nonzero) frame has been seen, so an
     // all-silent stream can't keep dragging the screen back from the screensaver.
-    if (vuSeenReal && uiState == UI_PLAY && (long)(millis() - vuSuppressUntil) >= 0) {
-      displayBlank = false;
-      drawPlayVisualizer();
-    }
+    if (vuSeenReal && uiState == UI_PLAY && (long)(millis() - vuSuppressUntil) >= 0) displayBlank = false;
     return;
   }
 
@@ -408,6 +428,10 @@ void parseMessage(String msg) {
     lastVuAt = 0;
     visualizerActive = false;
     vuSeenReal = false;
+    memset(barH, 0, sizeof(barH));
+    memset(peakH, 0, sizeof(peakH));
+    memset(peakVel, 0, sizeof(peakVel));
+    memset(peakHold, 0, sizeof(peakHold));
     Serial.print("POT:");          // push the last-used volume so playback starts at it
     Serial.println(playVolume);
     drawPlay();
@@ -513,10 +537,11 @@ void handleEncoder(int dir) {
 
 void setup() {
   setCpuFrequencyMhz(160);  // 240 -> 160: about half the CPU power, plenty for I2C at 400kHz
+  Serial.setRxBufferSize(1024);   // a 64-value VU: frame is ~200 bytes; the 256-byte default overflows
   Serial.begin(115200);
   esp_task_wdt_add(NULL);
   Wire.begin(21, 22);
-  Wire.setClock(400000);   // 100kHz was too slow to push full frames at the visualizer's ~15fps
+  Wire.setClock(400000);   // 800kHz left a stuck column on the OLED
   pinMode(BTN_STOP_PIN, INPUT_PULLUP);
   pinMode(BTN_HOME_PIN, INPUT_PULLUP);
   pinMode(BTN_PLAYPAUSE_PIN, INPUT_PULLUP);
@@ -594,5 +619,8 @@ void loop() {
 
   if (uiState != UI_DISCONNECTED && (long)(millis() - lastMsgTime) >= PING_TIMEOUT_MS) drawDisconnected();
 
-  delay(20);
+  if (vuSeenReal && visualizerActive && uiState == UI_PLAY && !displayBlank &&
+      (long)(millis() - vuSuppressUntil) >= 0 && millis() - lastVizAt >= VIZ_FRAME_MS) drawPlayVisualizer();
+
+  delay(4);
 }

@@ -36,12 +36,13 @@ MPV_SOCKET = "/tmp/cd_player_mpv.sock"
 
 _CDROM_DRIVE_STATUS = 0x5326  # CDS_NO_DISC=1 TRAY_OPEN=2 DRIVE_NOT_READY=3 DISC_OK=4
 
-VU_BARS = 16  # must match the firmware's VU_BARS
-VU_RATE_HZ = 15
+VU_BARS = 64  # must match the firmware's VU_BARS
+VU_WINDOW = 2048  # FFT window (10.8Hz bins); hop stays VU_SAMPLE_RATE // VU_RATE_HZ
+VU_RATE_HZ = 30
 VU_SAMPLE_RATE = 22050
 VU_DB_FLOOR = -40      # dB below the adaptive reference that maps to a flat bar
-VU_REF_DECAY = 0.995   # per-frame relaxation of the reference level
-VU_PEAK_DECAY = 4      # bar units/frame a peak falls when nothing louder follows
+VU_REF_DECAY = 0.9975  # per-frame relaxation of the reference level
+VU_PEAK_DECAY = 2      # bar units/frame a peak falls when nothing louder follows
 LR_DB_FLOOR = -50      # stereo LED meters use an absolute dBFS scale (they should track loudness):
 LR_DB_CEIL = -6        # peaks at/below the floor light nothing, at/above the ceiling light all 8
 
@@ -153,7 +154,7 @@ def _pulse_default_monitor():
 
 
 def vu_loop(ser, stop_event, pause_event):
-    """Streams `VU:<16 levels>` (FFT of the mono mix, log-spaced bands) and
+    """Streams `VU:<64 levels>` (FFT of the mono mix, log-spaced bands) and
     `LR:<left>,<right>` (per-channel peak) to the ESP32, both 0-63. The bars use
     adaptive-dB scaling (a fixed gain can't show quiet motion without clipping);
     the L/R meters use fixed dBFS so they follow the actual volume.
@@ -162,7 +163,7 @@ def vu_loop(ser, stop_event, pause_event):
     monitor = _pulse_default_monitor() if np is not None else None
     if not monitor:
         return
-    chunk_samples = VU_SAMPLE_RATE // VU_RATE_HZ
+    chunk_samples = VU_SAMPLE_RATE // VU_RATE_HZ   # hop between frames
     chunk_bytes = chunk_samples * 4  # s16le stereo
     # --latency-msec=50: PulseAudio's default capture buffer delivers in ~2s
     # bursts, which starves the firmware's VU_TIMEOUT_MS and flickers to text.
@@ -173,11 +174,13 @@ def vu_loop(ser, stop_event, pause_event):
     except OSError:
         return
     try:
-        window = np.hanning(chunk_samples)
-        freqs = np.fft.rfftfreq(chunk_samples, d=1.0 / VU_SAMPLE_RATE)
-        edges = np.searchsorted(freqs, np.geomspace(40, VU_SAMPLE_RATE / 2, VU_BARS + 1))
+        # 64 log-spaced bands need finer bins than one 67ms hop gives, so the FFT runs
+        # over a sliding window of the last VU_WINDOW mono samples.
+        window = np.hanning(VU_WINDOW)
+        freqs = np.fft.rfftfreq(VU_WINDOW, d=1.0 / VU_SAMPLE_RATE)
+        edges = np.searchsorted(freqs, np.geomspace(50, VU_SAMPLE_RATE / 2, VU_BARS + 1))
+        mono_buf = np.zeros(VU_WINDOW, dtype=np.float32)
         ref_level = 1e-6
-        shown = [0.0] * VU_BARS
         lr_shown = [0.0, 0.0]
         while not stop_event.is_set():
             raw = proc.stdout.read(chunk_bytes)
@@ -188,15 +191,15 @@ def vu_loop(ser, stop_event, pause_event):
             if pause_event.is_set():
                 continue
             stereo = np.frombuffer(raw, dtype=np.int16).reshape(-1, 2).astype(np.float32) / 32768.0
-            spectrum = np.abs(np.fft.rfft(stereo.mean(axis=1) * window))
+            mono_buf = np.concatenate((mono_buf, stereo.mean(axis=1)))[-VU_WINDOW:]
+            spectrum = np.abs(np.fft.rfft(mono_buf * window))
             mags = [float(spectrum[lo:max(hi, lo + 1)].max())
                     for lo, hi in zip(edges[:-1], edges[1:])]
             ref_level = max(max(mags), ref_level * VU_REF_DECAY, 1e-6)
-            for i, mag in enumerate(mags):
-                db = 20 * float(np.log10(mag / ref_level + 1e-9))
-                target = max(0.0, min(63.0, (db - VU_DB_FLOOR) * 63.0 / -VU_DB_FLOOR))
-                shown[i] = target if target > shown[i] else max(0.0, shown[i] - VU_PEAK_DECAY)
-            send_line(ser, "VU:" + ",".join(str(int(v)) for v in shown))
+            # Raw targets, one char per band (chr(48+level)); the firmware does the smoothing.
+            db = 20 * np.log10(np.array(mags) / ref_level + 1e-9)
+            levels = np.clip((db - VU_DB_FLOOR) * 63.0 / -VU_DB_FLOOR, 0, 63).astype(int)
+            send_line(ser, "VU:" + "".join(chr(48 + v) for v in levels))
             # Stereo level meters (LED sticks): per-channel peak on a fixed dBFS scale.
             peaks = np.abs(stereo).max(axis=0)
             for i, peak in enumerate(peaks):
