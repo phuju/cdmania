@@ -1,2 +1,3 @@
 pyserial
-numpy  # optional: powers the OLED spectrum visualizer, skipped silently if missing
+# optional: powers the OLED spectrum visualizer, skipped silently if missing
+numpy
