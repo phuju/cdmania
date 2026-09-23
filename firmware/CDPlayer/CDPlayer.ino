@@ -1,257 +1,105 @@
-// CD Player front-panel firmware - ESP32 WROOM-32 DevKit + SSD1306 OLED.
+// CD player front panel - ESP32 WROOM-32 DevKit + SSD1306 OLED, USB serial only.
 //
-// Forked from the DiscStation project's arduino/DiscStation/DiscStation.ino
-// (not that file - this is a separate, dedicated sketch for a playback-only
-// CD player). Kept from the original: OLED drawing primitives, the VU
-// spectrum visualizer, the Wi-Fi/OTA connection lifecycle, the rotary
-// encoder's quadrature decoder, and the screensaver. Stripped: the
-// BURN/PLAY/RIP home menu, burn-mode/speed pickers, burn/rip progress UI,
-// the IP/QR web-setup screen, and the TCP remote-control transport (nothing
-// in this project uses a web/mobile remote - USB serial only).
+// Talks to cd_player.py on the host. Sends: STOP, PLAY_BUTTON (pause toggle, or
+// "play" from STANDBY), NEXT/PREV (track skip), POT:<0-100> (volume), PONG.
+// Receives: STANDBY:, PLAY:, PLAY_STATUS:, VU:<16 levels>, PING.
 //
-// Button roles: EJECT (GPIO14) and a long-press on PLAY/PAUSE both send a
-// single "STOP" - never a real eject. This drive is locked against ejection
-// by the host at startup (SCSI PREVENT/ALLOW MEDIUM REMOVAL); the disc is
-// meant to be lifted out by hand once stopped, not pushed out through the
-// slot. See ~/Desktop/cd-player-project-findings.md for why.
+// STOP never ejects: the host locks the drive at startup and the disc is lifted
+// out by hand. The STOP button (GPIO14), HOME during playback, and a long-press
+// on PLAY/PAUSE all send the same rate-limited STOP.
+//
+// Forked from DiscStation's DiscStation.ino with the burn/rip menus, Wi-Fi and
+// TCP remote removed.
 
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include "esp_task_wdt.h"
-#include <WiFi.h>
-#include "esp_mac.h"
-#include <WiFiManager.h>
-#include <ESPmDNS.h>
-#include <Preferences.h>
-#include <ArduinoOTA.h>
-
-// Optional build-time Wi-Fi override for power users: copy secrets.h.example
-// to secrets.h (git-ignored) and set WIFI_SSID / WIFI_PASS / OTA_PASSWORD.
-// If WIFI_SSID is defined the runtime setup portal is skipped entirely.
-#if __has_include("secrets.h")
-  #include "secrets.h"
-#endif
 
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_RESET    -1
 #define I2C_ADDRESS   0x3C
 
-#define BTN_STOP_PIN      14  // was EJECT - now always just STOPs, never ejects
-#define BTN_HOME_PIN      13  // also carries the 10s Wi-Fi-reset hold
+#define BTN_STOP_PIN      14
+#define BTN_HOME_PIN      13
 #define BTN_PLAYPAUSE_PIN 15
 #define ENC_CLK_PIN       32
 #define ENC_DT_PIN        33
-#define ENC_SW_PIN         4  // encoder's click switch
+#define ENC_SW_PIN         4  // encoder click
 
-#define DEBOUNCE_MS      50
-#define LONG_PRESS_MS    1000
-#define ENC_CLICK_GUARD_MS 200  // ignore new SW presses this soon after a rotation tick (rotation vibration can bounce SW low)
-#define STOP_MSG_MS      3000   // how long "Stopping..." stays on screen before returning to STANDBY
-#define STOP_COOLDOWN_MS  750   // ignore a new STOP trigger this soon after the last one - caps a
-                                 // noisy/faulty button or wire to a low rate instead of a flood; a
-                                 // real press is never anywhere near this fast
-#define STANDBY_BLANK_MS 60000
-#define IDLE_BLANK_MS    15000   // no input this long on STANDBY/PLAY -> spinning-disc screensaver
-                                 // (this power bank's no-load auto-shutoff trips at ~30s idle; keep this
-                                 // well under that so the screensaver's current draw beats it there)
-#define SAVER_FRAME_MS   90      // screensaver frame interval (~11fps)
-#define PING_TIMEOUT_MS  30000
+#define DEBOUNCE_MS        50
+#define LONG_PRESS_MS      1000
+#define ENC_CLICK_GUARD_MS 200   // rotation vibration can bounce SW low; ignore clicks this soon after a tick
+#define STOP_MSG_MS        3000  // how long "Stopping..." shows before returning to STANDBY
+#define STOP_COOLDOWN_MS   750   // drop STOP triggers this soon after the last: caps a noisy/faulty
+                                 // button to a trickle instead of a flood (seen during bring-up)
+#define IDLE_BLANK_MS      15000 // no input this long in STANDBY (or paused) -> spinning-disc screensaver
+#define SAVER_FRAME_MS     90
+#define PING_TIMEOUT_MS    30000 // no message from the host this long -> DISCONNECTED screen
 
-#define VU_BARS       16   // must match the host's VU: band count
-#define VU_TIMEOUT_MS 1200 // no VU: update this long -> host isn't sending (paused/stopped), fall back to text
-#define VU_ENTRY_DELAY_MS  10000  // stay on the text status screen this long after entering PLAY
-#define VU_RESUME_DELAY_MS  7000  // ...and this long after any input while already in PLAY
-
-#define WIFI_RESET_HOLD_MS      10000  // hold HOME/BACK this long on STANDBY to wipe Wi-Fi creds
-#define WIFI_CONNECT_TIMEOUT_MS 18000  // give a stored-creds join this long before falling to the portal
-#define WIFI_RETRY_MS           15000  // if a live link drops, force a re-join after this
-
-WiFiManager wm;
-Preferences prefs;
-bool wifiConnected = false;
-bool wifiInitDone = false;
-bool portalActive = false;
-bool otaEnabled = false;
-bool credsJustSaved = false;
-bool wifiResetArmed = false;
-unsigned long wifiDropAt = 0;
-String apName = "CDPlayer";
-String mdnsHost = "cdplayer";
-
-void drawSetup();       // fwd decls (defined with the other draw* below)
-void drawWifiReset();
-void drawPlayVisualizer();
-
-String deviceSuffix() {
-  uint8_t mac[6];
-  esp_read_mac(mac, ESP_MAC_WIFI_STA);  // factory MAC from eFuse - valid before the Wi-Fi driver starts
-  char buf[5];
-  snprintf(buf, sizeof(buf), "%02X%02X", mac[4], mac[5]);
-  return String(buf);
-}
-
-void loadCreds(String& ssid, String& pass) {
-  prefs.begin("cdplayer", true);
-  ssid = prefs.getString("ssid", "");
-  pass = prefs.getString("pass", "");
-  prefs.end();
-}
-
-void saveCreds(const String& ssid, const String& pass) {
-  prefs.begin("cdplayer", false);
-  prefs.putString("ssid", ssid);
-  prefs.putString("pass", pass);
-  prefs.end();
-}
-
-void clearCreds() {
-  prefs.begin("cdplayer", false);
-  prefs.clear();
-  prefs.end();
-  WiFi.disconnect(true, true);   // also wipe the ESP's own persisted creds
-}
-
-void wmSaveCallback() {
-  saveCreds(wm.getWiFiSSID(), wm.getWiFiPass());
-  credsJustSaved = true;         // loop() reboots cleanly into STA mode
-}
-
-void onWifiUp() {
-  portalActive = false;
-  wifiConnected = true;
-  wifiDropAt = 0;
-  WiFi.setSleep(WIFI_PS_MIN_MODEM);
-  MDNS.begin(mdnsHost.c_str());   // gives OTA a resolvable <mdnsHost>.local name
-#ifdef OTA_PASSWORD
-  ArduinoOTA.setHostname(mdnsHost.c_str());
-  ArduinoOTA.setPassword(OTA_PASSWORD);
-  ArduinoOTA.begin();
-  otaEnabled = true;
-#endif
-  Serial.print("WiFi OK "); Serial.println(WiFi.localIP());
-}
-
-void startPortal() {
-  Serial.print("WiFi: setup portal '"); Serial.print(apName); Serial.println("'");
-  portalActive = true;
-  WiFi.mode(WIFI_AP_STA);
-  wm.setConfigPortalBlocking(false);
-  wm.setConfigPortalTimeout(0);
-  wm.setSaveConfigCallback(wmSaveCallback);
-  wm.startConfigPortal(apName.c_str());   // open AP at 192.168.4.1
-  drawSetup();
-}
-
-void initWiFi() {
-  apName   = "CDPlayer-" + deviceSuffix();
-  mdnsHost = "cdplayer-" + deviceSuffix();
-  mdnsHost.toLowerCase();
-
-  WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
-  WiFi.setSleep(WIFI_PS_MIN_MODEM);
-
-  String ssid, pass;
-#ifdef WIFI_SSID
-  ssid = WIFI_SSID;
-  pass = WIFI_PASS;
-#else
-  loadCreds(ssid, pass);
-#endif
-
-  if (ssid.length() > 0) {
-    Serial.print("WiFi "); Serial.print(ssid); Serial.print("...");
-    WiFi.begin(ssid.c_str(), pass.c_str());
-    unsigned long t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_CONNECT_TIMEOUT_MS) {
-      esp_task_wdt_reset();
-      delay(200);
-    }
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println(" OK");
-    onWifiUp();
-  } else {
-    if (ssid.length() > 0) Serial.println(" fail (2.4GHz band / wrong password?)");
-    startPortal();
-  }
-}
+#define VU_BARS            16    // must match the host's VU_BARS
+#define VU_TIMEOUT_MS      1200  // no VU: frame this long -> fall back to the text screen
+#define VU_ENTRY_DELAY_MS  10000 // text screen this long after playback starts, then bars
+#define VU_RESUME_DELAY_MS 7000  // ...and this long after any input during PLAY
+#define VU_TOP_MARGIN      16    // px of headroom above the tallest bar
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-enum UiState {
-  UI_STATUS,
-  UI_PLAY,
-  UI_STANDBY,
-  UI_DISCONNECTED,
-  UI_SETUP
-};
+enum UiState { UI_STOPPING, UI_PLAY, UI_STANDBY, UI_DISCONNECTED };
+UiState uiState = UI_STANDBY;
 
-UiState uiState = UI_STATUS;
-
-String line1 = "Status: READY";
+String line1 = "";   // PLAY screen: track line
 String line2 = "";
-String line3 = "";
-
 bool displayOk = false;
-unsigned long returnToHomeAt = 0;
-unsigned long lastStopSentAt = 0;   // STOP_COOLDOWN_MS gate, see sendStop()
-unsigned long playStatusAt = 0;
-bool playStatusTemp = false;
+int displayRotation = 0;   // flipped by turning the encoder in STANDBY (upside-down mounting)
 
-// Encoder click (SW) - short/long press state
-unsigned long encClickDownAt = 0;
-bool encClickDown = false;
-unsigned long encClickLastDebounce = 0;
-
-// STOP button (physically the old EJECT button) - single press, no long-press timer needed
-bool stopBtnDown = false;
-unsigned long stopBtnLastDebounce = 0;
-
-// HOME/BACK button - single press; also carries the 10s Wi-Fi-reset hold
-unsigned long homeDownAt = 0;
-bool homeDown = false;
-unsigned long homeLastDebounce = 0;
-
-// PLAY/PAUSE button - short = pause/resume, long = stop
-unsigned long playpauseDownAt = 0;
-bool playpauseDown = false;
-unsigned long playpauseLastDebounce = 0;
-
-int playVolume = 50;
-bool playSeekMode = false;   // false = encoder rotate adjusts volume (default); true = track skip
-unsigned long standbyStartTime = 0;
+unsigned long returnToStandbyAt = 0;
+unsigned long lastStopSentAt = 0;
 unsigned long lastMsgTime = 0;
-unsigned long lastInputTime = 0;   // last button press / screen change; drives the idle screensaver
-bool displayBlank = false;          // true = real UI hidden, disc screensaver running; any input restores it
+unsigned long lastInputTime = 0;   // last input/screen change; drives the idle screensaver
+bool displayBlank = false;         // true = screensaver running; any input restores the UI
 unsigned long lastSaverFrame = 0;
 int saverStep = 0;
-bool isPaused = false;   // drives the screensaver during UI_PLAY - never blank while actively playing
 
-// Spectrum visualizer: host streams real playback levels as "VU:v0,v1,...".
-// While they keep arriving, PLAY shows full-screen bars instead of the usual
-// status text; VU_TIMEOUT_MS after they stop (paused/stopped host-side) it
-// falls back to the normal drawPlay() screen.
+int playVolume = 50;
+bool playSeekMode = false;   // false: encoder = volume; true: encoder = track skip
+bool isPaused = false;       // the screensaver may only take over PLAY while paused
+
+// Spectrum visualizer: the host streams "VU:v0,v1,...". While frames keep
+// arriving PLAY shows bars; VU_TIMEOUT_MS after they stop it falls back to text.
 uint8_t vuLevel[VU_BARS];
 bool visualizerActive = false;
 unsigned long lastVuAt = 0;
-unsigned long vuSuppressUntil = 0;   // bars withheld (text screen shown instead) until millis() reaches this
-bool vuSeenReal = false;   // has this PLAY session ever gotten a VU: frame with a nonzero bar -
-                           // a session-level fact, decided once and left alone. Deliberately
-                           // separate from visualizerActive/lastVuAt, which track "is the
-                           // stream still alive" per frame (including legitimate all-zero
-                           // frames during quiet music) - conflating the two previously caused
-                           // the bars/screensaver to flicker whenever a frame read all zero.
-int displayRotation = 0;
+unsigned long vuSuppressUntil = 0;   // bars withheld (text shown) until millis() reaches this
+bool vuSeenReal = false;   // has this PLAY session ever seen a nonzero bar? Decided once per session,
+                           // deliberately separate from visualizerActive/lastVuAt (stream liveness,
+                           // which must also count legitimate all-zero frames) - merging the two
+                           // made bars and screensaver flicker on quiet frames.
 
-// --- Rotary encoder decode ---
-// Ben Buxton's full-step quadrature state machine. Reads BOTH pins on every
-// change and only commits a tick after a complete, valid 4-transition
-// sequence - contact bounce just walks between non-committing states instead
-// of producing a spurious tick, so no time debounce is needed.
+// --- Buttons: one debounced press/release tracker each ---
+struct Btn { uint8_t pin; bool down; unsigned long downAt, lastRelease; };
+Btn stopBtn{BTN_STOP_PIN}, homeBtn{BTN_HOME_PIN}, playBtn{BTN_PLAYPAUSE_PIN}, encBtn{ENC_SW_PIN};
+
+// True once on release; *heldMs = how long it was held. allowPress=false ignores a new press.
+bool btnReleased(Btn& b, unsigned long* heldMs = nullptr, bool allowPress = true) {
+  bool low = digitalRead(b.pin) == LOW;
+  if (low && !b.down && allowPress && millis() - b.lastRelease > DEBOUNCE_MS) {
+    b.down = true;
+    b.downAt = millis();
+  }
+  if (!low && b.down) {
+    b.down = false;
+    b.lastRelease = millis();
+    if (heldMs) *heldMs = millis() - b.downAt;
+    return true;
+  }
+  return false;
+}
+
+// --- Rotary encoder: Ben Buxton's full-step quadrature state machine ---
+// Reads both pins on every change and only commits a tick after a complete valid
+// 4-transition sequence, so contact bounce needs no time debounce.
 #define ENC_R_START     0x0
 #define ENC_R_CW_FINAL  0x1
 #define ENC_R_CW_BEGIN  0x2
@@ -273,32 +121,30 @@ const uint8_t ENC_TTABLE[7][4] = {
 };
 
 volatile uint8_t encState = ENC_R_START;
-volatile int16_t encTicks = 0;   // whole detents ready for loop() to drain
-volatile uint32_t encLastActivityMs = 0;   // refreshed on every raw pin transition, not just
-                                            // committed ticks - guards handleSelectPress's SW
-                                            // read against bounce/crosstalk from a spin in progress
+volatile int16_t encTicks = 0;             // whole detents waiting for loop() to drain
+volatile uint32_t encLastActivityMs = 0;   // every raw pin transition, not just committed ticks
 
 void IRAM_ATTR encoderISR() {
   encLastActivityMs = millis();
   uint8_t pinState = (digitalRead(ENC_DT_PIN) << 1) | digitalRead(ENC_CLK_PIN);
   encState = ENC_TTABLE[encState & 0xF][pinState];
   uint8_t dir = encState & 0x30;
-  // Flipped from the table's literal CW/CCW so the tick sign matches this
-  // encoder's physical wiring: turning the knob clockwise should increase
-  // (next track, volume up), not decrease.
+  // Sign flipped from the table so clockwise = increase (next track, volume up).
   if (dir == ENC_DIR_CW) encTicks--;
   else if (dir == ENC_DIR_CCW) encTicks++;
 }
 
+// --- Drawing ---
 void printUpper(String value) {
   value.toUpperCase();
   display.print(value);
 }
 
-void drawChrome() {
+void drawHeader() {
   display.setRotation(displayRotation);
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
+  // corner ticks
   display.drawLine(0, 0, 4, 0, SSD1306_WHITE);
   display.drawLine(0, 0, 0, 4, SSD1306_WHITE);
   display.drawLine(123, 0, 127, 0, SSD1306_WHITE);
@@ -307,45 +153,27 @@ void drawChrome() {
   display.drawLine(0, 59, 0, 63, SSD1306_WHITE);
   display.drawLine(123, 63, 127, 63, SSD1306_WHITE);
   display.drawLine(127, 59, 127, 63, SSD1306_WHITE);
-}
-
-void drawHeader() {
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  drawChrome();
   display.setCursor(4, 0);
   display.print("CD PLAYER");
   display.drawLine(6, 10, 121, 10, SSD1306_WHITE);
 }
 
-void drawStatus() {
-  uiState = UI_STATUS;
+void drawStopping() {
+  uiState = UI_STOPPING;
   if (!displayOk) return;
-
   display.clearDisplay();
   drawHeader();
-
   display.setCursor(2, 20);
-  printUpper(line1);
-  display.setCursor(2, 34);
-  printUpper(line2);
-  display.setCursor(2, 48);
-  printUpper(line3);
-
+  display.print("STOPPING...");
   display.display();
 }
 
 void drawStandby() {
-  // While the Wi-Fi setup portal is up and the player is otherwise idle,
-  // the standby screen doubles as the setup instructions.
-  if (portalActive) { drawSetup(); return; }
   uiState = UI_STANDBY;
-  returnToHomeAt = 0;
-  standbyStartTime = millis();
+  returnToStandbyAt = 0;
   lastInputTime = millis();
   displayBlank = false;
   if (!displayOk) return;
-
   display.clearDisplay();
   drawHeader();
   display.setCursor(2, 25);
@@ -355,45 +183,11 @@ void drawStandby() {
   display.display();
 }
 
-void drawSetup() {
-  uiState = UI_SETUP;
-  returnToHomeAt = 0;
-  displayBlank = false;
-  lastInputTime = millis();
-  if (!displayOk) return;
-
-  display.clearDisplay();
-  drawHeader();
-  display.setCursor(2, 16);
-  display.print("WIFI SETUP");
-  display.setCursor(2, 28);
-  display.print("JOIN:");
-  display.setCursor(2, 38);
-  printUpper(apName);
-  display.setCursor(2, 50);
-  display.print("THEN 192.168.4.1");
-  display.display();
-}
-
-void drawWifiReset() {
-  uiState = UI_SETUP;
-  displayBlank = false;
-  if (!displayOk) return;
-  display.clearDisplay();
-  drawHeader();
-  display.setCursor(2, 25);
-  display.print("WIFI RESET");
-  display.setCursor(2, 40);
-  display.print("REBOOTING...");
-  display.display();
-}
-
 void drawDisconnected() {
   uiState = UI_DISCONNECTED;
-  returnToHomeAt = 0;
+  returnToStandbyAt = 0;
   displayBlank = false;
   if (!displayOk) return;
-
   display.clearDisplay();
   drawHeader();
   display.setCursor(2, 25);
@@ -403,15 +197,57 @@ void drawDisconnected() {
   display.display();
 }
 
-// 24-step sine table x64: sin(i*15deg)*64. Drives the idle disc screensaver.
+// Full-width spectrum bars, no header, capped by VU_TOP_MARGIN. Falls back to
+// drawPlay() once VU: frames stop (see VU_TIMEOUT_MS in loop()).
+void drawPlayVisualizer() {
+  uiState = UI_PLAY;
+  returnToStandbyAt = 0;
+  if (!displayOk) return;
+  display.clearDisplay();
+  const int gap = 2;
+  const int maxH = SCREEN_HEIGHT - VU_TOP_MARGIN;
+  const int barW = (SCREEN_WIDTH - gap * (VU_BARS - 1)) / VU_BARS;
+  int x = (SCREEN_WIDTH - (barW * VU_BARS + gap * (VU_BARS - 1))) / 2;
+  for (int i = 0; i < VU_BARS; i++) {
+    int h = map(vuLevel[i], 0, 63, 0, maxH);
+    if (h > 0) display.fillRect(x, SCREEN_HEIGHT - h, barW, h, SSD1306_WHITE);
+    x += barW + gap;
+  }
+  display.display();
+}
+
+void drawPlay() {
+  uiState = UI_PLAY;
+  returnToStandbyAt = 0;
+  lastInputTime = millis();   // fresh content gets a full IDLE_BLANK_MS before any screensaver
+  if (!displayOk) return;
+  display.clearDisplay();
+  drawHeader();
+  display.setCursor(2, 16);
+  printUpper(line1);
+  display.setCursor(2, 30);
+  printUpper(line2);
+  display.setCursor(2, 44);
+  if (playSeekMode) {
+    display.print("TURN // SKIP TRACK");
+  } else {
+    display.print("VOL // ");
+    display.print(playVolume);
+    display.print("%");
+  }
+  display.setCursor(2, 56);
+  display.print("CLICK // ");
+  display.print(playSeekMode ? "VOL MODE" : "SKIP MODE");
+  display.display();
+}
+
+// 24-step sine table x64: sin(i*15deg)*64. Drives the disc screensaver.
 const int8_t SIN24[24] = {
   0, 17, 32, 45, 55, 62, 64, 62, 55, 45, 32, 17,
   0, -17, -32, -45, -55, -62, -64, -62, -55, -45, -32, -17
 };
 
-// Spinning-disc screensaver frame - shown after IDLE_BLANK_MS on STANDBY/PLAY
-// instead of powering the panel off. Keeps the OLED lit and the I2C bus busy so
-// a USB power-bank feeding the remote doesn't hit its no-load auto-shutoff.
+// Spinning-disc screensaver frame.
 void drawDiscSaver(int step) {
   if (!displayOk) return;
   const int cx = 64, cy = 32, R = 30;
@@ -443,14 +279,13 @@ void drawDiscSaver(int step) {
   display.display();
 }
 
-// Returns true if this call actually woke a blanked screen - callers use that
-// to swallow the wake press so it doesn't also trigger a menu action.
+// Redraws the real UI over a running screensaver. True if it woke the screen.
 bool wakeDisplay() {
   if (!displayBlank || !displayOk) return false;
   display.ssd1306_command(0xAF);
   displayBlank = false;
   switch (uiState) {
-    case UI_STATUS: drawStatus(); break;
+    case UI_STOPPING: drawStopping(); break;
     case UI_PLAY:
       if (vuSeenReal && visualizerActive && (long)(millis() - lastVuAt) < VU_TIMEOUT_MS &&
           (long)(millis() - vuSuppressUntil) >= 0) drawPlayVisualizer();
@@ -458,64 +293,11 @@ bool wakeDisplay() {
       break;
     case UI_STANDBY: drawStandby(); break;
     case UI_DISCONNECTED: drawDisconnected(); break;
-    case UI_SETUP: drawSetup(); break;
   }
   return true;
 }
 
-#define VU_TOP_MARGIN 16   // px of empty headroom above the tallest possible bar
-
-// Full-screen-width spectrum bars, no header/chrome, capped short of the top
-// edge (VU_TOP_MARGIN) so a loud peak doesn't run the panel edge-to-edge.
-// Falls back to the normal drawPlay() text screen once VU: updates stop
-// arriving (see VU_TIMEOUT_MS in loop()).
-void drawPlayVisualizer() {
-  uiState = UI_PLAY;
-  returnToHomeAt = 0;
-  if (!displayOk) return;
-
-  display.clearDisplay();
-  const int gap = 2;
-  const int maxH = SCREEN_HEIGHT - VU_TOP_MARGIN;
-  const int barW = (SCREEN_WIDTH - gap * (VU_BARS - 1)) / VU_BARS;
-  int x = (SCREEN_WIDTH - (barW * VU_BARS + gap * (VU_BARS - 1))) / 2;
-  for (int i = 0; i < VU_BARS; i++) {
-    int h = map(vuLevel[i], 0, 63, 0, maxH);
-    if (h > 0) display.fillRect(x, SCREEN_HEIGHT - h, barW, h, SSD1306_WHITE);
-    x += barW + gap;
-  }
-  display.display();
-}
-
-void drawPlay() {
-  uiState = UI_PLAY;
-  returnToHomeAt = 0;
-  lastInputTime = millis();   // real status content (track change, pause/resume) gets a full
-                               // IDLE_BLANK_MS on screen before the screensaver reclaims it
-  if (!displayOk) return;
-
-  display.clearDisplay();
-  drawHeader();
-
-  display.setCursor(2, 16);
-  printUpper(line1);
-  display.setCursor(2, 30);
-  printUpper(line2);
-  display.setCursor(2, 44);
-  if (playSeekMode) {
-    display.print("TURN // SKIP TRACK");
-  } else {
-    display.print("VOL // ");
-    display.print(playVolume);
-    display.print("%");
-  }
-  display.setCursor(2, 56);
-  display.print("CLICK // ");
-  display.print(playSeekMode ? "VOL MODE" : "SKIP MODE");
-
-  display.display();
-}
-
+// --- Host messages ---
 void parseMessage(String msg) {
   msg.trim();
 
@@ -527,9 +309,7 @@ void parseMessage(String msg) {
   }
 
   if (msg.startsWith("VU:")) {
-    // No wakeDisplay()/RCV echo here - this arrives ~15x/sec while playing,
-    // wakeDisplay() would draw stale bars a frame early, and echoing it
-    // would spam the serial log for no reason.
+    // Arrives ~15x/sec: no wakeDisplay()/RCV echo (would draw stale bars / spam the log).
     lastMsgTime = millis();
     String rest = msg.substring(3);
     for (int i = 0; i < VU_BARS; i++) vuLevel[i] = 0;
@@ -543,23 +323,14 @@ void parseMessage(String msg) {
       rest = rest.substring(comma + 1);
     }
     if (anyNonzero) vuSeenReal = true;
-    // lastVuAt/visualizerActive/lastInputTime update on EVERY frame, zero or
-    // not - they track "is the stream still alive", and real music routinely
-    // produces a frame where every bar reads 0. Only gating those three on
-    // anyNonzero would make ordinary quiet frames look like "host stopped
-    // sending" to the unrelated VU_TIMEOUT_MS check below, flickering
-    // bars/screensaver during normal playback.
+    // Liveness (visualizerActive/lastVuAt) updates on EVERY frame, zero or not:
+    // real music produces all-zero frames, and treating those as "stream died"
+    // flickers bars and screensaver.
     visualizerActive = true;
     lastVuAt = millis();
-    lastInputTime = millis();   // the visualizer's own continuous redraw already beats the
-                                 // power-bank shutoff - no need for the screensaver too
-    // Drawing bars (and reclaiming the screen from the disc-spinner screensaver,
-    // if it's up) is the one thing that DOES stay gated on vuSeenReal - a host
-    // that's technically capturing but getting only silence sends real VU:
-    // frames that are all zero forever. Without this gate, every one of those
-    // frames would re-draw a blank bars screen and set displayBlank = false,
-    // fighting the disc-spinner screensaver for the display instead of
-    // leaving it alone once chosen.
+    lastInputTime = millis();
+    // Only redraw bars once a real (nonzero) frame has been seen, so an
+    // all-silent stream can't keep dragging the screen back from the screensaver.
     if (vuSeenReal && uiState == UI_PLAY && (long)(millis() - vuSuppressUntil) >= 0) {
       displayBlank = false;
       drawPlayVisualizer();
@@ -569,7 +340,6 @@ void parseMessage(String msg) {
 
   wakeDisplay();
   lastMsgTime = millis();
-
   Serial.print("RCV:");
   Serial.println(msg);
 
@@ -580,11 +350,11 @@ void parseMessage(String msg) {
     line1 = msg.substring(5);
     line2 = "Playing disc";
     playSeekMode = false;          // always start in volume mode
-    isPaused = false;               // assume playing at track start
-    vuSuppressUntil = millis() + VU_ENTRY_DELAY_MS;   // text screen first, bars after a beat
-    lastVuAt = 0;                  // fresh session - unknown yet whether the host even sends VU: at all
+    isPaused = false;
+    vuSuppressUntil = millis() + VU_ENTRY_DELAY_MS;   // text first, bars after a beat
+    lastVuAt = 0;
     visualizerActive = false;
-    vuSeenReal = false;            // unknown yet whether this session ever gets a real (nonzero) frame
+    vuSeenReal = false;
     Serial.print("POT:");          // push the last-used volume so playback starts at it
     Serial.println(playVolume);
     drawPlay();
@@ -592,194 +362,14 @@ void parseMessage(String msg) {
   } else if (msg.startsWith("PLAY_STATUS:")) {
     line1 = msg.substring(12);
     if (line1.length() > 20) line1 = line1.substring(0, 20);
-    if (line1 == "PLAYING" || line1 == "PAUSED" || line1.startsWith("TRACK ")) {
-      playStatusTemp = false;
-      if (line1 == "PLAYING") isPaused = false;
-      else if (line1 == "PAUSED") isPaused = true;
-    } else {
-      playStatusAt = millis();
-      playStatusTemp = true;
-    }
-    drawPlay();
-
-  } else if (msg.startsWith("STATUS:")) {
-    returnToHomeAt = 0;
-    line1 = msg.substring(7);
-    line2 = "";
-    line3 = "";
-    drawStatus();
-
-  } else if (msg.startsWith("WARNING:")) {
-    returnToHomeAt = 0;
-    line1 = "!! WARNING !!";
-    line2 = msg.substring(8);
-    if (line2.length() > 20) line2 = line2.substring(0, 20);
-    line3 = "";
-    drawStatus();
-
-  } else if (msg.startsWith("ERROR:")) {
-    returnToHomeAt = 0;
-    line1 = "!! ERROR";
-    line2 = msg.substring(6);
-    line3 = "";
-    drawStatus();
-  }
-}
-
-void setup() {
-  setCpuFrequencyMhz(160);  // 240 -> 160: ~halves CPU power, Wi-Fi/I2C/OTA all fine at 160
-  Serial.begin(115200);
-  esp_task_wdt_add(NULL);
-  Wire.begin(21, 22);
-  Wire.setClock(400000);   // SSD1306 supports I2C fast-mode; the default 100kHz was too slow to
-                           // push a full 128x64 frame at the visualizer's ~15fps without stutter
-  pinMode(BTN_STOP_PIN, INPUT_PULLUP);
-  pinMode(BTN_HOME_PIN, INPUT_PULLUP);
-  pinMode(BTN_PLAYPAUSE_PIN, INPUT_PULLUP);
-  pinMode(ENC_SW_PIN, INPUT_PULLUP);
-  pinMode(ENC_CLK_PIN, INPUT_PULLUP);
-  pinMode(ENC_DT_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(ENC_CLK_PIN), encoderISR, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(ENC_DT_PIN), encoderISR, CHANGE);
-
-  displayOk = display.begin(SSD1306_SWITCHCAPVCC, I2C_ADDRESS);
-
-  if (displayOk) {
-    Serial.println("Display OK");
-  } else {
-    Serial.println("Display FAILED");
-    delay(3000);
-  }
-
-  drawStandby();
-  lastMsgTime = millis();
-  lastInputTime = millis();
-  Serial.println("CDPLAYER_READY");
-}
-
-void handleSelectPress(bool longPress) {
-  if (wakeDisplay()) { lastInputTime = millis(); return; }  // wake-only press, swallow the action
-  lastInputTime = millis();
-  if (uiState == UI_STATUS && line1 == "Stopping...") {
-    // Manual escape if stuck on the stopping screen with no host response
-    drawStandby();
-
-  } else if (uiState == UI_DISCONNECTED) {
-    drawStandby();
-
-  } else if (uiState == UI_PLAY) {
-    vuSuppressUntil = millis() + VU_RESUME_DELAY_MS;   // any PLAY input -> back to text for a beat
-    playSeekMode = !playSeekMode;   // encoder click swaps what rotating does
+    if (line1 == "PLAYING") isPaused = false;
+    else if (line1 == "PAUSED") isPaused = true;
     drawPlay();
   }
 }
 
-// Encoder rotation. STANDBY just flips displayRotation (upside-down mounting).
-// PLAY defaults to adjusting volume; a short encoder click (see
-// handleSelectPress) swaps it to track-skip instead.
-void handleEncoderCW() {
-  if (wakeDisplay()) { lastInputTime = millis(); return; }  // wake-only turn, swallow the action
-  lastInputTime = millis();
-  if (uiState == UI_STANDBY) {
-    displayRotation = 2;
-    drawStandby();
-  } else if (uiState == UI_PLAY) {
-    vuSuppressUntil = millis() + VU_RESUME_DELAY_MS;   // any PLAY input -> back to text for a beat
-    if (!playSeekMode) {
-      playVolume = min(100, playVolume + 5);
-      Serial.print("POT:");
-      Serial.println(playVolume);
-      drawPlay();
-    } else {
-      Serial.println("NEXT");   // ponytail: track-skip not wired up host-side yet; host ignores
-                                 // unrecognized lines gracefully, add mpv chapter-seek when needed
-    }
-  }
-}
-
-void handleEncoderCCW() {
-  if (wakeDisplay()) { lastInputTime = millis(); return; }  // wake-only turn, swallow the action
-  lastInputTime = millis();
-  if (uiState == UI_STANDBY) {
-    displayRotation = 0;
-    drawStandby();
-  } else if (uiState == UI_PLAY) {
-    vuSuppressUntil = millis() + VU_RESUME_DELAY_MS;   // any PLAY input -> back to text for a beat
-    if (!playSeekMode) {
-      playVolume = max(0, playVolume - 5);
-      Serial.print("POT:");
-      Serial.println(playVolume);
-      drawPlay();
-    } else {
-      Serial.println("PREV");   // ponytail: see NEXT above
-    }
-  }
-}
-
-// Shared by every STOP trigger (dedicated button, HOME from PLAY, PLAY/PAUSE
-// long-press). Rate-limited by STOP_COOLDOWN_MS - see its comment above -
-// found necessary after a faulty button/wire flooded this line tens of
-// thousands of times/sec during bring-up; a real press can never re-trigger
-// this fast, so silently dropping repeats inside the cooldown is safe.
-void sendStop() {
-  if ((long)(millis() - lastStopSentAt) < STOP_COOLDOWN_MS) return;
-  lastStopSentAt = millis();
-  Serial.println("STOP");
-  line1 = "Stopping...";
-  line2 = "";
-  line3 = "";
-  returnToHomeAt = millis() + STOP_MSG_MS;
-  drawStatus();
-}
-
-// STOP: physically the old EJECT button. Never actually ejects - the drive is
-// locked against ejection by the host, and the disc comes out by hand.
-void handleStopButton() {
-  if (wakeDisplay()) { lastInputTime = millis(); return; }
-  lastInputTime = millis();
-  if (uiState == UI_PLAY || uiState == UI_STANDBY || uiState == UI_DISCONNECTED) {
-    sendStop();
-  }
-}
-
-// HOME/BACK: from PLAY, also STOPs (there's no menu to back out of otherwise).
-void handleHomeButton() {
-  if (wakeDisplay()) { lastInputTime = millis(); return; }
-  lastInputTime = millis();
-  if (uiState == UI_PLAY) {
-    sendStop();
-  } else if (uiState != UI_STANDBY) {
-    drawStandby();
-  }
-}
-
-// PLAY/PAUSE: during PLAY, short press toggles pause and long press STOPs
-// (same as the dedicated STOP button). From STANDBY, a short press also
-// sends PLAY_BUTTON - the host takes that as "probe the drive and play"
-// when nothing's currently playing, so this is how you resume after STOP
-// without having to physically remove and reinsert the disc.
-void handlePlayPauseButton(bool longPress) {
-  if (wakeDisplay()) { lastInputTime = millis(); return; }
-  lastInputTime = millis();
-  if (uiState == UI_PLAY) {
-    vuSuppressUntil = millis() + VU_RESUME_DELAY_MS;   // any PLAY input -> back to text for a beat
-    if (longPress) {
-      sendStop();
-    } else {
-      Serial.println("PLAY_BUTTON");
-    }
-  } else if (uiState == UI_STANDBY && !longPress) {
-    Serial.println("PLAY_BUTTON");
-  }
-}
-
-// Drains every line currently buffered on the serial link in one go instead
-// of one per loop() call. VU: frames arrive fast enough (~15/sec) that
-// drawing each one in turn made the display fall further and further behind
-// real-time once a single draw took longer than the send interval - only the
-// last VU: seen in a batch is kept/rendered, so the visualizer always shows
-// "now" instead of working through a backlog. Every other message type still
-// gets parsed in order; only VU: is collapsible like this.
+// Drains everything buffered on the link. Only the newest VU: frame in a batch
+// is rendered - drawing each one made the display lag behind real time.
 void drainAndDispatch() {
   String pendingVu = "";
   while (Serial.available()) {
@@ -791,153 +381,136 @@ void drainAndDispatch() {
   if (pendingVu.length() > 0) parseMessage(pendingVu);
 }
 
-void loop() {
-  if (!wifiInitDone && millis() > 3000) {
-    wifiInitDone = true;
-    initWiFi();
-  }
+// --- Input handlers ---
+// Every input stamps activity. True if it only woke the screensaver (swallow the action).
+bool inputWakesOnly() {
+  bool woke = wakeDisplay();
+  lastInputTime = millis();
+  return woke;
+}
 
-  if (credsJustSaved) {          // portal saved new creds -> reboot into clean STA
-    drawWifiReset();
-    delay(600);
-    ESP.restart();
-  }
+// Shared by every STOP trigger; rate-limited by STOP_COOLDOWN_MS.
+void sendStop() {
+  if ((long)(millis() - lastStopSentAt) < STOP_COOLDOWN_MS) return;
+  lastStopSentAt = millis();
+  Serial.println("STOP");
+  returnToStandbyAt = millis() + STOP_MSG_MS;
+  drawStopping();
+}
 
-  if (portalActive) {
-    wm.process();
-    if (WiFi.status() == WL_CONNECTED) onWifiUp();
-  }
+void handleStopButton() {
+  if (inputWakesOnly()) return;
+  if (uiState == UI_PLAY || uiState == UI_STANDBY || uiState == UI_DISCONNECTED) sendStop();
+}
 
-  // Live link dropped: WiFi.setAutoReconnect handles most; if still down after
-  // WIFI_RETRY_MS, force a fresh join.
-  if (wifiConnected && WiFi.status() != WL_CONNECTED) {
-    if (wifiDropAt == 0) wifiDropAt = millis();
-    else if (millis() - wifiDropAt > WIFI_RETRY_MS) {
-      wifiDropAt = millis();
-      WiFi.disconnect();
-      WiFi.begin();
-    }
-  } else if (wifiConnected) {
-    wifiDropAt = 0;
-  }
+// HOME/BACK: STOP during PLAY, otherwise back to STANDBY.
+void handleHomeButton() {
+  if (inputWakesOnly()) return;
+  if (uiState == UI_PLAY) sendStop();
+  else if (uiState != UI_STANDBY) drawStandby();
+}
 
-  if (wifiConnected && WiFi.status() == WL_CONNECTED && otaEnabled) {
-    ArduinoOTA.handle();
+// PLAY/PAUSE: in PLAY, short = pause toggle, long = STOP. From STANDBY a short
+// press sends PLAY_BUTTON too - the host re-probes the drive and plays, which
+// is how you resume after STOP without removing the disc.
+void handlePlayPauseButton(bool longPress) {
+  if (inputWakesOnly()) return;
+  if (uiState == UI_PLAY) {
+    vuSuppressUntil = millis() + VU_RESUME_DELAY_MS;   // any PLAY input -> text for a beat
+    if (longPress) sendStop();
+    else Serial.println("PLAY_BUTTON");
+  } else if (uiState == UI_STANDBY && !longPress) {
+    Serial.println("PLAY_BUTTON");
   }
+}
 
-  esp_task_wdt_reset();
-  if (Serial.available()) {
-    drainAndDispatch();
-  }
-
-  if (returnToHomeAt != 0 && (long)(millis() - returnToHomeAt) >= 0) {
-    drawStandby();
-  }
-
-  if (playStatusTemp && (long)(millis() - playStatusAt) >= 2500) {
-    playStatusTemp = false;
-    line1 = "PLAYING";
+// Encoder click: in PLAY swaps rotation between volume and track skip.
+void handleEncoderClick() {
+  if (inputWakesOnly()) return;
+  if (uiState == UI_STOPPING || uiState == UI_DISCONNECTED) {
+    drawStandby();   // manual escape if the host never answered
+  } else if (uiState == UI_PLAY) {
+    vuSuppressUntil = millis() + VU_RESUME_DELAY_MS;
+    playSeekMode = !playSeekMode;
     drawPlay();
   }
+}
 
-  // --- Encoder rotation: drain ticks accumulated by encoderISR ---
-  {
-    noInterrupts();
-    int16_t ticks = encTicks;
-    encTicks = 0;
-    interrupts();
-    while (ticks > 0) { handleEncoderCW(); ticks--; }
-    while (ticks < 0) { handleEncoderCCW(); ticks++; }
-  }
-
-  // --- Encoder click (SW) - same debounce/long-press shape as a button.
-  // Also guarded against rotation: spinning the knob can momentarily bounce
-  // SW low too, which was being misread as a real click. ---
-  {
-    bool sw = digitalRead(ENC_SW_PIN) == LOW;
-    if (sw && !encClickDown && millis() - encClickLastDebounce > DEBOUNCE_MS &&
-        millis() - encLastActivityMs > ENC_CLICK_GUARD_MS) {
-      encClickDown = true;
-      encClickDownAt = millis();
-    }
-    if (!sw && encClickDown) {
-      encClickDown = false;
-      encClickLastDebounce = millis();
-      handleSelectPress(millis() - encClickDownAt >= LONG_PRESS_MS);
+// Encoder rotation, dir = +1 clockwise / -1 counter-clockwise. STANDBY flips the
+// display; PLAY adjusts volume or skips tracks depending on playSeekMode.
+void handleEncoder(int dir) {
+  if (inputWakesOnly()) return;
+  if (uiState == UI_STANDBY) {
+    displayRotation = dir > 0 ? 2 : 0;
+    drawStandby();
+  } else if (uiState == UI_PLAY) {
+    vuSuppressUntil = millis() + VU_RESUME_DELAY_MS;
+    if (playSeekMode) {
+      Serial.println(dir > 0 ? "NEXT" : "PREV");
+    } else {
+      playVolume = constrain(playVolume + 5 * dir, 0, 100);
+      Serial.print("POT:");
+      Serial.println(playVolume);
+      drawPlay();
     }
   }
+}
 
-  // --- STOP button (single press, no long-press timer) ---
-  {
-    bool st = digitalRead(BTN_STOP_PIN) == LOW;
-    if (st && !stopBtnDown && millis() - stopBtnLastDebounce > DEBOUNCE_MS) {
-      stopBtnDown = true;
-    }
-    if (!st && stopBtnDown) {
-      stopBtnDown = false;
-      stopBtnLastDebounce = millis();
-      handleStopButton();
-    }
+void setup() {
+  setCpuFrequencyMhz(160);  // 240 -> 160: about half the CPU power, plenty for I2C at 400kHz
+  Serial.begin(115200);
+  esp_task_wdt_add(NULL);
+  Wire.begin(21, 22);
+  Wire.setClock(400000);   // 100kHz was too slow to push full frames at the visualizer's ~15fps
+  pinMode(BTN_STOP_PIN, INPUT_PULLUP);
+  pinMode(BTN_HOME_PIN, INPUT_PULLUP);
+  pinMode(BTN_PLAYPAUSE_PIN, INPUT_PULLUP);
+  pinMode(ENC_SW_PIN, INPUT_PULLUP);
+  pinMode(ENC_CLK_PIN, INPUT_PULLUP);
+  pinMode(ENC_DT_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_CLK_PIN), encoderISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_DT_PIN), encoderISR, CHANGE);
+
+  displayOk = display.begin(SSD1306_SWITCHCAPVCC, I2C_ADDRESS);
+  if (displayOk) {
+    Serial.println("Display OK");
+  } else {
+    Serial.println("Display FAILED");
+    delay(3000);
   }
 
-  // --- HOME/BACK button (single press; 10s hold = Wi-Fi reset) ---
-  {
-    bool hm = digitalRead(BTN_HOME_PIN) == LOW;
-    if (hm && !homeDown && millis() - homeLastDebounce > DEBOUNCE_MS) {
-      homeDown = true;
-      homeDownAt = millis();
-      wifiResetArmed = false;
-    }
-    // 10s hold on HOME/SETUP/STANDBY = wipe Wi-Fi creds + reboot to portal. Fires
-    // while still held so the eventual release doesn't also trigger the normal action.
-    if (hm && homeDown && !wifiResetArmed &&
-        (uiState == UI_SETUP || uiState == UI_STANDBY) &&
-        millis() - homeDownAt >= WIFI_RESET_HOLD_MS) {
-      wifiResetArmed = true;
-      Serial.println("WiFi: creds wiped, rebooting");
-      clearCreds();
-      drawWifiReset();
-      delay(800);
-      ESP.restart();
-    }
-    if (!hm && homeDown) {
-      homeDown = false;
-      homeLastDebounce = millis();
-      if (!wifiResetArmed) handleHomeButton();
-      wifiResetArmed = false;
-    }
-  }
+  drawStandby();
+  lastMsgTime = millis();
+  Serial.println("CDPLAYER_READY");
+}
 
-  // --- PLAY/PAUSE button (short = pause/resume, long = stop) ---
-  {
-    bool pp = digitalRead(BTN_PLAYPAUSE_PIN) == LOW;
-    if (pp && !playpauseDown && millis() - playpauseLastDebounce > DEBOUNCE_MS) {
-      playpauseDown = true;
-      playpauseDownAt = millis();
-    }
-    if (!pp && playpauseDown) {
-      playpauseDown = false;
-      playpauseLastDebounce = millis();
-      handlePlayPauseButton(millis() - playpauseDownAt >= LONG_PRESS_MS);
-    }
-  }
+void loop() {
+  esp_task_wdt_reset();
+  if (Serial.available()) drainAndDispatch();
 
-  // --- Visualizer timeout: host stopped sending VU: (paused/stopped) ---
+  if (returnToStandbyAt != 0 && (long)(millis() - returnToStandbyAt) >= 0) drawStandby();
+
+  // Encoder rotation: drain ticks accumulated by the ISR.
+  noInterrupts();
+  int16_t ticks = encTicks;
+  encTicks = 0;
+  interrupts();
+  while (ticks > 0) { handleEncoder(+1); ticks--; }
+  while (ticks < 0) { handleEncoder(-1); ticks++; }
+
+  unsigned long held = 0;
+  if (btnReleased(encBtn, nullptr, millis() - encLastActivityMs > ENC_CLICK_GUARD_MS)) handleEncoderClick();
+  if (btnReleased(stopBtn)) handleStopButton();
+  if (btnReleased(homeBtn)) handleHomeButton();
+  if (btnReleased(playBtn, &held)) handlePlayPauseButton(held >= LONG_PRESS_MS);
+
+  // Host stopped sending VU: (paused/stopped): back to the text screen.
   if (visualizerActive && (long)(millis() - lastVuAt) >= VU_TIMEOUT_MS) {
     visualizerActive = false;
     if (uiState == UI_PLAY && !displayBlank) drawPlay();
   }
 
-  // --- Idle disc screensaver (STANDBY, or PLAY while paused) ---
-  // PLAY is excluded while actively playing - blanking away from the one
-  // screen with actually-useful live content (track/volume text or the VU
-  // bars) while a disc is playing was an active annoyance with no upside
-  // (this ESP32 is USB-powered from the PC it talks to over serial, not the
-  // battery-pack mod the screensaver's power-saving purpose was originally
-  // for - see the removal note this replaced). But "nothing is playing" in
-  // PLAY only ever means paused (a real stop exits to UI_STANDBY already),
-  // so it's fine - wanted, even - for the screensaver to take over after the
-  // same idle timeout once paused.
+  // Idle screensaver: STANDBY, or PLAY while paused - never over live playback.
   if (displayOk && !displayBlank &&
       (uiState == UI_STANDBY || (uiState == UI_PLAY && isPaused)) &&
       (long)(millis() - lastInputTime) >= IDLE_BLANK_MS) {
@@ -945,18 +518,13 @@ void loop() {
     saverStep = 0;
     lastSaverFrame = 0;
   }
-  if (displayBlank && displayOk &&
-      (long)(millis() - lastSaverFrame) >= SAVER_FRAME_MS) {
+  if (displayBlank && displayOk && (long)(millis() - lastSaverFrame) >= SAVER_FRAME_MS) {
     lastSaverFrame = millis();
     drawDiscSaver(saverStep);
     saverStep = (saverStep + 1) % 24;
   }
 
-  // --- PING timeout (disconnected) ---
-  if (uiState != UI_DISCONNECTED &&
-      (long)(millis() - lastMsgTime) >= PING_TIMEOUT_MS) {
-    drawDisconnected();
-  }
+  if (uiState != UI_DISCONNECTED && (long)(millis() - lastMsgTime) >= PING_TIMEOUT_MS) drawDisconnected();
 
   delay(20);
 }
