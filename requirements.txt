@@ -1,0 +1,2 @@
+pyserial
+numpy  # optional: powers the OLED spectrum visualizer, skipped silently if missing
