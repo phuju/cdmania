@@ -42,6 +42,8 @@ VU_SAMPLE_RATE = 22050
 VU_DB_FLOOR = -40      # dB below the adaptive reference that maps to a flat bar
 VU_REF_DECAY = 0.995   # per-frame relaxation of the reference level
 VU_PEAK_DECAY = 4      # bar units/frame a peak falls when nothing louder follows
+LR_DB_FLOOR = -50      # stereo LED meters use an absolute dBFS scale (they should track loudness):
+LR_DB_CEIL = -6        # peaks at/below the floor light nothing, at/above the ceiling light all 8
 
 _ser_lock = threading.Lock()
 
@@ -125,10 +127,12 @@ def _mpv_ipc(payload, timeout=0.5):
 
 
 def _mpv_command(command):
+    """True if mpv accepted it (False while its IPC socket isn't up yet)."""
     try:
         _mpv_ipc(json.dumps({"command": command}).encode() + b"\n")
+        return True
     except OSError:
-        pass
+        return False
 
 
 def _mpv_query(command):
@@ -149,19 +153,20 @@ def _pulse_default_monitor():
 
 
 def vu_loop(ser, stop_event, pause_event):
-    """Streams `VU:<16 levels>` to the ESP32 (FFT of the real output, log-spaced
-    bands, adaptive-dB scaling - a fixed gain can't show quiet motion without
-    clipping loud parts). While paused the capture pipe is still drained but
-    nothing is sent: parec keeps tapping the silent monitor, and an all-zero
+    """Streams `VU:<16 levels>` (FFT of the mono mix, log-spaced bands) and
+    `LR:<left>,<right>` (per-channel peak) to the ESP32, both 0-63. The bars use
+    adaptive-dB scaling (a fixed gain can't show quiet motion without clipping);
+    the L/R meters use fixed dBFS so they follow the actual volume.
+    While paused the capture pipe is still drained but nothing is sent: parec keeps tapping the silent monitor, and an all-zero
     stream would keep forcing the bars screen over the screensaver."""
     monitor = _pulse_default_monitor() if np is not None else None
     if not monitor:
         return
     chunk_samples = VU_SAMPLE_RATE // VU_RATE_HZ
-    chunk_bytes = chunk_samples * 2  # s16le mono
+    chunk_bytes = chunk_samples * 4  # s16le stereo
     # --latency-msec=50: PulseAudio's default capture buffer delivers in ~2s
     # bursts, which starves the firmware's VU_TIMEOUT_MS and flickers to text.
-    cmd = ["parec", "--format=s16le", f"--rate={VU_SAMPLE_RATE}", "--channels=1",
+    cmd = ["parec", "--format=s16le", f"--rate={VU_SAMPLE_RATE}", "--channels=2",
            "--latency-msec=50", "-d", monitor]
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
@@ -173,6 +178,7 @@ def vu_loop(ser, stop_event, pause_event):
         edges = np.searchsorted(freqs, np.geomspace(40, VU_SAMPLE_RATE / 2, VU_BARS + 1))
         ref_level = 1e-6
         shown = [0.0] * VU_BARS
+        lr_shown = [0.0, 0.0]
         while not stop_event.is_set():
             raw = proc.stdout.read(chunk_bytes)
             if len(raw) < chunk_bytes:
@@ -181,8 +187,8 @@ def vu_loop(ser, stop_event, pause_event):
                 continue
             if pause_event.is_set():
                 continue
-            samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-            spectrum = np.abs(np.fft.rfft(samples * window))
+            stereo = np.frombuffer(raw, dtype=np.int16).reshape(-1, 2).astype(np.float32) / 32768.0
+            spectrum = np.abs(np.fft.rfft(stereo.mean(axis=1) * window))
             mags = [float(spectrum[lo:max(hi, lo + 1)].max())
                     for lo, hi in zip(edges[:-1], edges[1:])]
             ref_level = max(max(mags), ref_level * VU_REF_DECAY, 1e-6)
@@ -191,6 +197,13 @@ def vu_loop(ser, stop_event, pause_event):
                 target = max(0.0, min(63.0, (db - VU_DB_FLOOR) * 63.0 / -VU_DB_FLOOR))
                 shown[i] = target if target > shown[i] else max(0.0, shown[i] - VU_PEAK_DECAY)
             send_line(ser, "VU:" + ",".join(str(int(v)) for v in shown))
+            # Stereo level meters (LED sticks): per-channel peak on a fixed dBFS scale.
+            peaks = np.abs(stereo).max(axis=0)
+            for i, peak in enumerate(peaks):
+                db = 20 * float(np.log10(peak + 1e-9))
+                target = max(0.0, min(63.0, (db - LR_DB_FLOOR) * 63.0 / (LR_DB_CEIL - LR_DB_FLOOR)))
+                lr_shown[i] = target if target > lr_shown[i] else max(0.0, lr_shown[i] - VU_PEAK_DECAY)
+            send_line(ser, f"LR:{int(lr_shown[0])},{int(lr_shown[1])}")
     finally:
         proc.terminate()
         try:
@@ -207,6 +220,8 @@ class Player:
         self.vu_thread = None
         self.vu_stop = self.vu_pause = None
         self.last_track = None
+        self.volume = 50            # matches the firmware's default; updated by POT: lines
+        self.volume_dirty = False   # a POT: arrived before mpv's IPC was up
 
     def playing(self):
         return self.proc is not None and self.proc.poll() is None
@@ -225,7 +240,7 @@ class Player:
         print(f"Playing {self.device}")
         self.proc = subprocess.Popen(
             [mpv, "--input-ipc-server=" + MPV_SOCKET, "--force-window=no", "--idle=no",
-             "--cdrom-device=" + self.device, "--cdda-cdtext=yes", "cdda://"])
+             f"--volume={self.volume}", "--cdrom-device=" + self.device, "--cdda-cdtext=yes", "cdda://"])
         self.last_track = None
         send_line(self.ser, "PLAY:Audio CD")
         if np is not None:
@@ -265,8 +280,16 @@ class Player:
                 self.vu_pause.set() if paused else self.vu_pause.clear()
 
     def set_volume(self, vol):
-        if self.playing():
-            _mpv_command(["set_property", "volume", vol])
+        """The panel answers PLAY: with POT: right after mpv is launched, before its
+        IPC socket exists - so remember the value and retry (apply_volume) instead
+        of losing it, which left mpv at its default 100 while the OLED said 50."""
+        self.volume = vol
+        self.volume_dirty = True
+        self.apply_volume()
+
+    def apply_volume(self):
+        if self.volume_dirty and self.playing() and _mpv_command(["set_property", "volume", self.volume]):
+            self.volume_dirty = False
 
     def skip_track(self, delta):
         if self.playing():
@@ -332,6 +355,7 @@ def main():
 
             if now - last_track_check >= TRACK_CHECK_SECONDS:
                 last_track_check = now
+                player.apply_volume()
                 player.check_track()
 
             line = ser.readline().decode(errors="ignore").strip()

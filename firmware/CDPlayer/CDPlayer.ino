@@ -2,7 +2,7 @@
 //
 // Talks to cd_player.py on the host. Sends: STOP, PLAY_BUTTON (pause toggle, or
 // "play" from STANDBY), NEXT/PREV (track skip), POT:<0-100> (volume), PONG.
-// Receives: STANDBY:, PLAY:, PLAY_STATUS:, VU:<16 levels>, PING.
+// Receives: STANDBY:, PLAY:, PLAY_STATUS:, VU:<16 levels>, LR:<left>,<right>, PING.
 //
 // STOP never ejects: the host locks the drive at startup and the disc is lifted
 // out by hand. The STOP button (GPIO14), HOME during playback, and a long-press
@@ -15,6 +15,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include "esp_task_wdt.h"
+#include <FastLED.h>
 
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
@@ -43,6 +44,13 @@
 #define VU_ENTRY_DELAY_MS  10000 // text screen this long after playback starts, then bars
 #define VU_RESUME_DELAY_MS 7000  // ...and this long after any input during PLAY
 #define VU_TOP_MARGIN      16    // px of headroom above the tallest bar
+
+// Stereo level meters: two chained 1x8 WS2812B sticks (LEFT = pixels 0-7, RIGHT = 8-15).
+// Powered from the ESP32's USB 5V, so brightness and current are capped hard.
+#define LED_PIN            18
+#define LED_STICK          8
+#define LED_BRIGHTNESS     3     // of 255
+#define LED_MAX_MA         150
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
@@ -76,6 +84,38 @@ bool vuSeenReal = false;   // has this PLAY session ever seen a nonzero bar? Dec
                            // deliberately separate from visualizerActive/lastVuAt (stream liveness,
                            // which must also count legitimate all-zero frames) - merging the two
                            // made bars and screensaver flicker on quiet frames.
+
+// --- LED stereo meters ---
+// LR: frames carry 0-63 per channel; the host only sends them while audio plays,
+// so the meters also clear when frames stop (paused/stopped) or the UI leaves PLAY.
+CRGB leds[2 * LED_STICK];
+uint8_t lrLevel[2];
+bool ledsLit = false;
+unsigned long lastLrAt = 0;
+
+void clearMeters() {
+  if (!ledsLit) return;
+  ledsLit = false;
+  FastLED.clear();
+  FastLED.show();
+}
+
+void drawMeters() {
+  ledsLit = true;
+  FastLED.clear();
+  for (int ch = 0; ch < 2; ch++) {
+    int n = (lrLevel[ch] * LED_STICK + 31) / 63;   // 0-63 -> 0-8 LEDs lit
+    for (int row = 0; row < n && row < LED_STICK; row++) {
+      // Both bars grow upward. The right stick is mounted the other way round, so its
+      // pixels run top-to-bottom: pixel 8 is the top row, pixel 15 the bottom.
+      int px = ch == 0 ? row : 2 * LED_STICK - 1 - row;
+      // Smooth RGB blend from purple (bottom) to light blue (top): mixing the two
+      // colours directly gives a softer transition than stepping through hues.
+      leds[px] = blend(CRGB(150, 0, 255), CRGB(70, 190, 255), row * 255 / (LED_STICK - 1));
+    }
+  }
+  FastLED.show();
+}
 
 // --- Buttons: one debounced press/release tracker each ---
 struct Btn { uint8_t pin; bool down; unsigned long downAt, lastRelease; };
@@ -338,6 +378,19 @@ void parseMessage(String msg) {
     return;
   }
 
+  if (msg.startsWith("LR:")) {
+    // ~15x/sec like VU: no wake, no echo, and it does not count as user activity.
+    lastMsgTime = millis();
+    int comma = msg.indexOf(',');
+    if (comma > 3) {
+      lrLevel[0] = (uint8_t)constrain(msg.substring(3, comma).toInt(), 0, 63);
+      lrLevel[1] = (uint8_t)constrain(msg.substring(comma + 1).toInt(), 0, 63);
+      lastLrAt = millis();
+      if (uiState == UI_PLAY) drawMeters();
+    }
+    return;
+  }
+
   wakeDisplay();
   lastMsgTime = millis();
   Serial.print("RCV:");
@@ -368,17 +421,19 @@ void parseMessage(String msg) {
   }
 }
 
-// Drains everything buffered on the link. Only the newest VU: frame in a batch
+// Drains everything buffered on the link. Only the newest VU:/LR: frame in a batch
 // is rendered - drawing each one made the display lag behind real time.
 void drainAndDispatch() {
-  String pendingVu = "";
+  String pendingVu = "", pendingLr = "";
   while (Serial.available()) {
     String msg = Serial.readStringUntil('\n');
     if (msg.length() == 0) continue;
     if (msg.startsWith("VU:")) pendingVu = msg;
+    else if (msg.startsWith("LR:")) pendingLr = msg;
     else parseMessage(msg);
   }
   if (pendingVu.length() > 0) parseMessage(pendingVu);
+  if (pendingLr.length() > 0) parseMessage(pendingLr);
 }
 
 // --- Input handlers ---
@@ -471,6 +526,12 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(ENC_CLK_PIN), encoderISR, CHANGE);
   attachInterrupt(digitalPinToInterrupt(ENC_DT_PIN), encoderISR, CHANGE);
 
+  FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, 2 * LED_STICK);
+  FastLED.setBrightness(LED_BRIGHTNESS);
+  FastLED.setDither(BINARY_DITHER);   // at this brightness the blend only exists via temporal dithering
+  FastLED.setMaxPowerInVoltsAndMilliamps(5, LED_MAX_MA);
+  FastLED.clear(true);
+
   displayOk = display.begin(SSD1306_SWITCHCAPVCC, I2C_ADDRESS);
   if (displayOk) {
     Serial.println("Display OK");
@@ -503,6 +564,13 @@ void loop() {
   if (btnReleased(stopBtn)) handleStopButton();
   if (btnReleased(homeBtn)) handleHomeButton();
   if (btnReleased(playBtn, &held)) handlePlayPauseButton(held >= LONG_PRESS_MS);
+
+  // Refresh every loop while lit: FastLED's temporal dithering only blends the dim
+  // colours if show() runs far more often than the ~15fps LR: frames.
+  if (ledsLit) FastLED.show();
+
+  // Meters go dark when LR: frames stop (paused/stopped) or the UI leaves PLAY.
+  if (ledsLit && (uiState != UI_PLAY || (long)(millis() - lastLrAt) >= VU_TIMEOUT_MS)) clearMeters();
 
   // Host stopped sending VU: (paused/stopped): back to the text screen.
   if (visualizerActive && (long)(millis() - lastVuAt) >= VU_TIMEOUT_MS) {
