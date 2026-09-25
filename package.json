@@ -10,7 +10,7 @@
     "scripts/postinstall.js",
     "cd_player.py",
     "requirements.txt",
-    "firmware/CDPlayer/",
+    "firmware/CDPlayer/CDPlayer.ino",
     "firmware/release/",
     "tools/",
     "README.md"

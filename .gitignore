@@ -3,3 +3,4 @@ secrets.h
 node_modules/
 *.tgz
 firmware/release/
+firmware/CDPlayer/build/
