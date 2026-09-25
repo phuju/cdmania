@@ -11,7 +11,9 @@ sg3-utils' `sg_raw`; numpy + PulseAudio's `parec`/`pactl` drive the OLED
 spectrum visualizer if present (skipped silently otherwise).
 """
 
+import base64
 import fcntl
+import hashlib
 import json
 import os
 import shutil
@@ -32,6 +34,9 @@ except ImportError:
 DISC_POLL_SECONDS = 1.5
 PING_SECONDS = 10
 TRACK_CHECK_SECONDS = 2
+FIRMWARE_DIR = Path(__file__).resolve().parent / "firmware" / "release"  # built by scripts/build-firmware.sh
+OTA_CHUNK = 512  # raw bytes per OTA_DATA line; must match the firmware's decode buffer
+VERSION_ASKS = 5  # opening the port resets the ESP32, so keep asking VERSION until it answers
 MPV_SOCKET = "/tmp/cd_player_mpv.sock"
 
 _CDROM_DRIVE_STATUS = 0x5326  # CDS_NO_DISC=1 TRAY_OPEN=2 DRIVE_NOT_READY=3 DISC_OK=4
@@ -119,6 +124,65 @@ def standby(ser):
     send_line(ser, "STANDBY:Insert disc")
 
 
+ota_active = threading.Event()  # set while a firmware image is streaming: VU/LR frames must stay quiet
+
+
+def shipped_firmware():
+    """(image path, {version,size,md5}) of the firmware this package ships, or (None, None)."""
+    try:
+        meta = json.loads((FIRMWARE_DIR / "firmware.json").read_text())
+        image = FIRMWARE_DIR / "cdplayer.bin"
+        return (image, meta) if image.is_file() else (None, None)
+    except (OSError, ValueError):
+        return None, None
+
+
+def fw_newer(shipped, running):
+    try:
+        return tuple(map(int, shipped.split("."))) > tuple(map(int, running.split(".")))
+    except ValueError:  # "dev" builds never get overwritten
+        return False
+
+
+def _ota_reply(ser, timeout=5):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        line = ser.readline().decode(errors="ignore").strip()
+        if line.startswith("OTA:"):
+            return line[4:]
+    return None
+
+
+def ota_update(ser, image, meta):
+    """Stream the image to the ESP32 (stop-and-wait, one ACK per chunk). The firmware
+    verifies the MD5 before switching slots, so a failed transfer leaves the old firmware."""
+    data = image.read_bytes()
+    if len(data) != meta["size"] or hashlib.md5(data).hexdigest() != meta["md5"]:
+        print("OTA: shipped image does not match firmware.json, not sending")
+        return False
+    ota_active.set()
+    try:
+        time.sleep(0.3)  # let an in-flight VU/LR write finish
+        ser.reset_input_buffer()
+        send_line(ser, f"OTA_BEGIN:{len(data)}|{meta['md5']}")
+        if _ota_reply(ser) != "READY":
+            print("OTA: remote refused the update")
+            return False
+        for i in range(0, len(data), OTA_CHUNK):
+            send_line(ser, "OTA_DATA:" + base64.b64encode(data[i:i + OTA_CHUNK]).decode())
+            if _ota_reply(ser) != "ACK":
+                print(f"OTA: transfer failed at byte {i}")
+                return False
+            if (i // OTA_CHUNK) % 100 == 0:
+                print(f"OTA: {i * 100 // len(data)}%")
+        send_line(ser, "OTA_END")
+        ok = _ota_reply(ser, timeout=15) == "DONE"
+        print("OTA: done, remote restarting" if ok else "OTA: verify failed on the remote")
+        return ok
+    finally:
+        ota_active.clear()
+
+
 def _mpv_ipc(payload, timeout=0.5):
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
         sock.settimeout(timeout)
@@ -188,7 +252,7 @@ def vu_loop(ser, stop_event, pause_event):
                 if proc.poll() is not None:
                     break
                 continue
-            if pause_event.is_set():
+            if pause_event.is_set() or ota_active.is_set():
                 continue
             stereo = np.frombuffer(raw, dtype=np.int16).reshape(-1, 2).astype(np.float32) / 32768.0
             mono_buf = np.concatenate((mono_buf, stereo.mean(axis=1)))[-VU_WINDOW:]
@@ -331,7 +395,10 @@ def main():
     standby(ser)
 
     last_status = None
-    last_poll = last_ping = last_track_check = 0.0
+    last_poll = last_ping = last_track_check = last_ver_ask = 0.0
+    ver_asks = 0
+    fw_version = None
+    fw_pending = False
 
     try:
         while True:
@@ -361,10 +428,32 @@ def main():
                 player.apply_volume()
                 player.check_track()
 
+            if fw_version is None and ver_asks < VERSION_ASKS and now - last_ver_ask >= 3:
+                last_ver_ask = now
+                ver_asks += 1
+                send_line(ser, "VERSION")
+                if ver_asks == VERSION_ASKS and shipped_firmware()[0]:
+                    print("Front panel never answered VERSION: firmware predates OTA, flash it once by cable (cdmania flash)")
+
+            if fw_pending and not player.playing():
+                fw_pending = False
+                image, meta = shipped_firmware()
+                if image and ota_update(ser, image, meta):
+                    time.sleep(4)  # the ESP32 reboots; USB serial stays up
+                    ser.reset_input_buffer()
+                    fw_version = None
+                    ver_asks = 0
+                    standby(ser)
+
             line = ser.readline().decode(errors="ignore").strip()
             if not line or line == "PONG" or line.startswith("RCV:"):
                 continue
             print(f"< {line}")
+            if line.startswith("VERSION:"):
+                fw_version = line[8:]
+                image, meta = shipped_firmware()
+                fw_pending = bool(image and fw_newer(meta["version"], fw_version))
+                continue
             if line == "STOP":
                 # Release the device before the SCSI stop: sent while mpv is
                 # mid-read it hung sg_raw for 5s on this USB-SATA bridge.

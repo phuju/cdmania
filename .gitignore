@@ -2,3 +2,4 @@ __pycache__/
 secrets.h
 node_modules/
 *.tgz
+firmware/release/

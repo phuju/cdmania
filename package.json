@@ -1,12 +1,41 @@
 {
   "name": "cdmania",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "CD player companion: auto-plays a locked slot-load drive, ESP32 OLED/LED front panel with 64-bar visualizer",
-  "bin": { "cdmania": "bin/cdmania.js" },
-  "files": ["bin/", "cd_player.py", "requirements.txt", "firmware/", "tools/", "README.md"],
-  "repository": { "type": "git", "url": "git+https://github.com/phuju/cdmania.git" },
-  "keywords": ["cd-player", "esp32", "raspberry-pi", "mpv", "ssd1306", "ws2812b"],
+  "bin": {
+    "cdmania": "bin/cdmania.js"
+  },
+  "files": [
+    "bin/",
+    "scripts/postinstall.js",
+    "cd_player.py",
+    "requirements.txt",
+    "firmware/CDPlayer/",
+    "firmware/release/",
+    "tools/",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/phuju/cdmania.git"
+  },
+  "keywords": [
+    "cd-player",
+    "esp32",
+    "raspberry-pi",
+    "mpv",
+    "ssd1306",
+    "ws2812b"
+  ],
   "license": "MIT",
-  "engines": { "node": ">=14" },
-  "os": ["linux"]
+  "engines": {
+    "node": ">=14"
+  },
+  "os": [
+    "linux"
+  ],
+  "scripts": {
+    "prepack": "bash scripts/build-firmware.sh",
+    "postinstall": "node scripts/postinstall.js"
+  }
 }

@@ -16,6 +16,17 @@
 #include <Adafruit_SSD1306.h>
 #include "esp_task_wdt.h"
 #include <FastLED.h>
+#include <Update.h>
+#include "mbedtls/base64.h"
+
+// Injected by scripts/build-firmware.sh as -DFW_VERSION=x.y.z; ad-hoc builds report "dev".
+#define FW_STR_(x) #x
+#define FW_STR(x) FW_STR_(x)
+#ifdef FW_VERSION
+  #define FW_VERSION_STR FW_STR(FW_VERSION)
+#else
+  #define FW_VERSION_STR "dev"
+#endif
 
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
@@ -363,9 +374,85 @@ bool wakeDisplay() {
   return true;
 }
 
+// --- Over-the-air update, pushed by the host over serial (stop-and-wait, one ACK per chunk) ---
+bool otaActive = false;
+size_t otaSize = 0, otaDone = 0;
+
+void drawOtaProgress(int pct) {
+  if (!displayOk) return;
+  display.clearDisplay();
+  drawHeader();
+  display.setCursor(2, 18);
+  display.print("UPDATING FIRMWARE");
+  display.drawRect(4, 32, 120, 10, SSD1306_WHITE);
+  display.fillRect(6, 34, (116 * pct) / 100, 6, SSD1306_WHITE);
+  display.setCursor(2, 50);
+  display.print("DO NOT POWER OFF");
+  display.display();
+}
+
+void otaAbort(const char* why) {
+  Update.abort();
+  otaActive = false;
+  clearMeters();
+  Serial.print("OTA:ERR ");
+  Serial.println(why);
+  drawStandby();
+}
+
+// The image is MD5- and header-checked by Update before the slot switch, so a bad transfer never boots.
+void handleOta(const String& msg) {
+  lastMsgTime = millis();
+  lastInputTime = millis();
+  if (msg.startsWith("OTA_BEGIN:")) {
+    int bar = msg.indexOf('|');
+    otaSize = msg.substring(10, bar).toInt();
+    String md5 = msg.substring(bar + 1);
+    if (bar < 0 || otaSize == 0 || md5.length() != 32) { Serial.println("OTA:ERR bad request"); return; }
+    if (displayBlank) { display.ssd1306_command(0xAF); displayBlank = false; }
+    clearMeters();
+    if (!Update.begin(otaSize)) { Serial.println("OTA:ERR no space"); return; }
+    Update.setMD5(md5.c_str());
+    otaActive = true;
+    otaDone = 0;
+    drawOtaProgress(0);
+    Serial.println("OTA:READY");
+  } else if (!otaActive) {
+    Serial.println("OTA:ERR not started");
+  } else if (msg.startsWith("OTA_DATA:")) {
+    uint8_t buf[512];
+    size_t n = 0;
+    if (mbedtls_base64_decode(buf, sizeof(buf), &n, (const uint8_t*)msg.c_str() + 9, msg.length() - 9) != 0 ||
+        Update.write(buf, n) != n) { otaAbort("write failed"); return; }
+    int before = otaDone * 100 / otaSize;
+    otaDone += n;
+    int pct = otaDone * 100 / otaSize;
+    if (pct / 5 != before / 5) drawOtaProgress(pct);
+    Serial.println("OTA:ACK");
+  } else if (msg == "OTA_END") {
+    if (otaDone == otaSize && Update.end(true)) {
+      Serial.println("OTA:DONE");
+      delay(500);
+      ESP.restart();
+    }
+    otaAbort("verify failed");
+  }
+}
+
 // --- Host messages ---
 void parseMessage(String msg) {
   msg.trim();
+
+  if (msg == "VERSION") {
+    Serial.print("VERSION:");
+    Serial.println(FW_VERSION_STR);
+    return;
+  }
+
+  if (msg.startsWith("OTA_")) {
+    handleOta(msg);
+    return;
+  }
 
   if (msg == "PING") {
     lastMsgTime = millis();
@@ -575,6 +662,13 @@ void loop() {
   if (Serial.available()) drainAndDispatch();
 
   if (returnToStandbyAt != 0 && (long)(millis() - returnToStandbyAt) >= 0) drawStandby();
+
+  // Mid-update the OLED belongs to the progress bar; give up if the host goes silent.
+  if (otaActive) {
+    if ((long)(millis() - lastMsgTime) >= 15000) otaAbort("timeout");
+    delay(2);
+    return;
+  }
 
   // Encoder rotation: drain ticks accumulated by the ISR.
   noInterrupts();
