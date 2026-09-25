@@ -23,7 +23,15 @@ RestartSec=3
 WantedBy=default.target
 `;
 
-const sh = (cmd, args) => spawnSync(cmd, args, { stdio: "inherit" }).status === 0;
+const sh = (cmd, args, env) => spawnSync(cmd, args, { stdio: "inherit", env: env || process.env }).status === 0;
+const have = (cmd) => spawnSync("which", [cmd]).status === 0;
+const user = os.userInfo().username;
+const localBin = path.join(os.homedir(), ".local", "bin");
+const withLocalBin = { ...process.env, PATH: `${localBin}:${process.env.PATH}` };
+const APT = ["mpv", "sg3-utils", "pulseaudio-utils", "pipewire", "pipewire-pulse", "wireplumber",
+  "python3", "python3-serial", "python3-numpy", "curl"];
+const DAC_LINE = "dtoverlay=iqaudio-dacplus";
+const FQBN = "esp32:esp32:esp32";
 
 const commands = {
   path: () => console.log(root),
@@ -39,6 +47,35 @@ const commands = {
     fs.rmSync(unitPath, { force: true });
     sh("systemctl", ["--user", "daemon-reload"]);
   },
+  setup: () => {
+    if (!have("apt-get")) return console.error("setup needs a Debian-family OS (apt). Install per README instead.");
+    if (!sh("sudo", ["apt-get", "install", "-y", ...APT])) return console.error("apt install failed");
+    sh("sudo", ["usermod", "-aG", "dialout,cdrom,audio", user]);
+    sh("sudo", ["loginctl", "enable-linger", user]);
+    commands["install-service"]();
+    console.log("\nsetup done. Log out and back in once (new groups), plug in the ESP32 + drive.");
+    console.log("Next: `cdmania flash` for the front panel; on a Pi with the DAC+ hat: `cdmania pi-dac`.");
+  },
+  "pi-dac": () => {
+    const cfg = ["/boot/firmware/config.txt", "/boot/config.txt"].find((p) => fs.existsSync(p));
+    if (!cfg) return console.error("no Raspberry Pi config.txt found; is this a Pi?");
+    if (fs.readFileSync(cfg, "utf8").includes(DAC_LINE)) return console.log("already enabled");
+    sh("sudo", ["sh", "-c", `printf '\n${DAC_LINE}\n' >> ${cfg}`]);
+    console.log(`added ${DAC_LINE} to ${cfg}; reboot to activate the Raspberry Pi DAC+`);
+  },
+  flash: () => {
+    const port = process.argv[3] || "/dev/ttyUSB0";
+    if (!have("arduino-cli") && !fs.existsSync(path.join(localBin, "arduino-cli"))) {
+      console.log("installing arduino-cli to ~/.local/bin (official installer)");
+      if (!sh("sh", ["-c", `curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | BINDIR="${localBin}" sh`])) return;
+    }
+    const cli = (...a) => sh("arduino-cli", a, withLocalBin);
+    const sketch = path.join(root, "firmware", "CDPlayer");
+    cli("core", "update-index");
+    cli("core", "install", "esp32:esp32");
+    cli("lib", "install", "Adafruit SSD1306", "Adafruit GFX Library", "FastLED");
+    if (cli("compile", "--fqbn", FQBN, sketch)) cli("upload", "-p", port, "--fqbn", FQBN, sketch);
+  },
   deps: () => sh("python3", ["-m", "pip", "install", "--user", "-r", path.join(root, "requirements.txt")]),
   version: () => console.log(require("../package.json").version),
 };
@@ -48,12 +85,14 @@ if (commands[cmd]) commands[cmd]();
 else {
   console.log(`cdmania ${require("../package.json").version}
 usage: cdmania <command>
+  setup              install everything (apt packages, groups, systemd service); run once
+  flash [port]       install arduino-cli + ESP32 core + libraries, then compile and upload the firmware
+  pi-dac             enable the Raspberry Pi DAC+ overlay in config.txt (Pi only)
   install-service    write + enable the systemd user service (cd_player.py from this package)
   uninstall-service  stop, disable and remove it
-  deps               pip install pyserial numpy (needs pip)
+  deps               pip fallback for pyserial/numpy (setup already installs them via apt)
   path               print where the player and firmware/ live
   version
-system packages needed: mpv sg3-utils pulseaudio-utils (parec/pactl) python3-pip
-firmware: open firmware/CDPlayer/CDPlayer.ino in Arduino IDE / arduino-cli (esp32:esp32:esp32)`);
+quick start: cdmania setup && cdmania flash`);
   process.exit(cmd ? 1 : 0);
 }

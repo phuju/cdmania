@@ -6,17 +6,17 @@ Companion for a slot-load CD drive (Panasonic UJ8C1 via JMS567 USB-SATA) with an
 - PLAY/PAUSE, encoder volume and track skip, track number and CD-Text title on the OLED.
 - 64-bar OLED spectrum visualizer with falling peak caps; stereo WS2812B LED level meters.
 
-## Install
+## Install (Debian / Raspberry Pi OS)
 ```
 npm install -g cdmania
-sudo apt install mpv sg3-utils pulseaudio-utils python3-pip
-cdmania deps
-cdmania install-service
+cdmania setup      # apt packages (mpv, sg3-utils, pipewire-pulse, pyserial, numpy), groups, systemd service
+cdmania flash      # arduino-cli + ESP32 core + libraries, compiles and uploads the front-panel firmware
+cdmania pi-dac     # Raspberry Pi DAC+ hat only: enables the audio overlay (then reboot)
 ```
-`cdmania path` shows where the code and `firmware/` live.
+Log out and in once after `setup` so the new groups apply. `cdmania path` shows where the code and `firmware/` live.
 
 ## ESP32 firmware
-Board: ESP32 WROOM-32 DevKit. Libraries: Adafruit SSD1306 + GFX, FastLED.
+Board: ESP32 WROOM-32 DevKit. `cdmania flash` does all of this; manual equivalent (libraries: Adafruit SSD1306 + GFX, FastLED):
 ```
 arduino-cli compile --fqbn esp32:esp32:esp32 firmware/CDPlayer
 arduino-cli upload  -p /dev/ttyUSB0 --fqbn esp32:esp32:esp32 firmware/CDPlayer

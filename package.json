@@ -1,6 +1,6 @@
 {
   "name": "cdmania",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "CD player companion: auto-plays a locked slot-load drive, ESP32 OLED/LED front panel with 64-bar visualizer",
   "bin": { "cdmania": "bin/cdmania.js" },
   "files": ["bin/", "cd_player.py", "requirements.txt", "firmware/", "tools/", "README.md"],
