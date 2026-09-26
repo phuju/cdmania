@@ -307,7 +307,7 @@ class Player:
         print(f"Playing {self.device}")
         self.proc = subprocess.Popen(
             [mpv, "--input-ipc-server=" + MPV_SOCKET, "--force-window=no", "--idle=no",
-             f"--volume={self.volume}", "--cdrom-device=" + self.device, "--cdda-cdtext=yes", "cdda://"])
+             f"--volume={self.volume}", "--cdda-device=" + self.device, "--cdda-cdtext=yes", "cdda://"])
         self.last_track = None
         send_line(self.ser, "PLAY:Audio CD")
         if np is not None:
