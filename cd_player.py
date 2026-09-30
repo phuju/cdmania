@@ -358,6 +358,16 @@ class Player:
         if self.volume_dirty and self.playing() and _mpv_command(["set_property", "volume", self.volume]):
             self.volume_dirty = False
 
+    def resync(self):
+        """The panel booted (or was plugged in) after we sent PLAY:/STANDBY:, so replay the state."""
+        if not self.playing():
+            standby(self.ser)
+            return
+        send_line(self.ser, "PLAY:Audio CD")
+        self.last_track = None  # check_track re-sends the track number
+        if _mpv_query(["get_property", "pause"]) is True:
+            send_line(self.ser, "PLAY_STATUS:PAUSED")
+
     def skip_track(self, delta):
         if self.playing():
             _mpv_command(["add", "chapter", delta])  # libcdio exposes each CD track as a chapter
@@ -449,7 +459,12 @@ def main():
             if not line or line == "PONG" or line.startswith("RCV:"):
                 continue
             print(f"< {line}")
+            if line == "CDPLAYER_READY":
+                player.resync()
+                continue
             if line.startswith("VERSION:"):
+                if fw_version is None:
+                    player.resync()  # first sign of life: covers a panel that booted after our PLAY:
                 fw_version = line[8:]
                 image, meta = shipped_firmware()
                 fw_pending = bool(image and fw_newer(meta["version"], fw_version))
