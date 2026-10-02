@@ -1,4 +1,5 @@
-// CD player front panel - ESP32 WROOM-32 DevKit + SSD1306 OLED, USB serial only.
+// CD player front panel - ESP32 WROOM-32 DevKit + ST7735R 1.8" TFT (160x128
+// landscape, SPI), USB serial only.
 //
 // Talks to cd_player.py on the host. Sends: STOP, PLAY_BUTTON (pause toggle, or
 // "play" from STANDBY), NEXT/PREV (track skip), POT:<0-100> (volume), PONG.
@@ -9,13 +10,14 @@
 // on PLAY/PAUSE all send the same rate-limited STOP.
 //
 // Forked from DiscStation's DiscStation.ino with the burn/rip menus, Wi-Fi and
-// TCP remote removed.
+// TCP remote removed. Originally drove an SSD1306 OLED + two WS2812B LED
+// sticks for stereo meters; the OLED and (fried) LEDs were replaced by this
+// one color TFT, which now draws the stereo meters on-screen instead.
 
-#include <Wire.h>
+#include <SPI.h>
 #include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include <Adafruit_ST7735.h>
 #include "esp_task_wdt.h"
-#include <FastLED.h>
 #include <Update.h>
 #include "mbedtls/base64.h"
 
@@ -28,10 +30,11 @@
   #define FW_VERSION_STR "dev"
 #endif
 
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-#define OLED_RESET    -1
-#define I2C_ADDRESS   0x3C
+#define SCREEN_WIDTH  160
+#define SCREEN_HEIGHT 128
+#define TFT_CS   5
+#define TFT_DC   16   // labeled RX2 on some 30-pin boards
+#define TFT_RST  17   // labeled TX2 on some 30-pin boards
 
 #define BTN_STOP_PIN      14
 #define BTN_HOME_PIN      13
@@ -50,24 +53,32 @@
 #define SAVER_FRAME_MS     90
 #define PING_TIMEOUT_MS    30000 // no message from the host this long -> DISCONNECTED screen
 
-#define VU_BARS            64    // must match the host's VU_BARS (128px / 64 = 2px pitch: 1px bar + 1px gap)
-#define VU_TIMEOUT_MS      1200  // no VU: frame this long -> fall back to the text screen
-#define VU_ENTRY_DELAY_MS  10000 // text screen this long after playback starts, then bars
+#define VU_BARS            64    // must match the host's VU_BARS
+#define VU_TIMEOUT_MS      1200  // no VU:/LR: frame this long -> fall back to the text screen / dark meters
+#define VU_ENTRY_DELAY_MS  10000 // text screen this long after playback starts, then bars+meters
 #define VU_RESUME_DELAY_MS 7000  // ...and this long after any input during PLAY
-#define VU_TOP_MARGIN      16    // px of headroom above the tallest bar
-#define VIZ_FRAME_MS       33    // bars redraw at ~30fps, independent of when host frames arrive
-#define BAR_RELEASE_S      0.06f // bar fall time constant (attack is instant)
+#define VU_TOP_MARGIN      10    // px of headroom above the tallest bar/meter
+#define VIZ_FRAME_MS       33    // bars+meters redraw at ~30fps, independent of when host frames arrive
+#define BAR_RELEASE_S      0.12f // bar ease time constant, both rise and fall - higher = calmer/smoother
 #define PEAK_HOLD_S        0.28f // a peak cap hangs this long before falling
 #define PEAK_GRAVITY       200.0f // px/s^2 the cap accelerates downward once released
 
-// Stereo level meters: two chained 1x8 WS2812B sticks (LEFT = pixels 0-7, RIGHT = 8-15).
-// Powered from the ESP32's USB 5V, so brightness and current are capped hard.
-#define LED_PIN            18
-#define LED_STICK          8
-#define LED_BRIGHTNESS     3     // of 255
-#define LED_MAX_MA         150
+// Stereo meter columns, to the right of the spectrum bars (see drawPlayVisualizer).
+#define METER_W     8
+#define METER_GAP   2
+#define METER_BLOCK (METER_W * 2 + METER_GAP)
+#define SEGMENT_LIT_H 3   // LED-block look: lit px, then a gap, repeating up the meter column
+#define SEGMENT_GAP_H 1
 
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+Adafruit_ST7735 display(TFT_CS, TFT_DC, TFT_RST);
+// Off-screen RAM frame for drawPlayVisualizer(): drawing ~150 small shapes
+// directly to the panel each frame meant ~150 separate SPI address-window
+// commands/frame, slow enough to fall behind the 33ms budget and show a
+// part-drawn frame (the strobe). Composing in RAM first (cheap) and pushing
+// the finished frame in one drawRGBBitmap() burst (one address-window, one
+// write) fixes both the speed and the tearing - the panel only ever receives
+// a complete frame.
+GFXcanvas16 vizCanvas(SCREEN_WIDTH, SCREEN_HEIGHT);
 
 enum UiState { UI_STOPPING, UI_PLAY, UI_STANDBY, UI_DISCONNECTED };
 UiState uiState = UI_STANDBY;
@@ -75,7 +86,7 @@ UiState uiState = UI_STANDBY;
 String line1 = "";   // PLAY screen: track line
 String line2 = "";
 bool displayOk = false;
-int displayRotation = 0;   // flipped by turning the encoder in STANDBY (upside-down mounting)
+int displayRotation = 1;   // 1=landscape, 3=landscape upside-down; flipped by the encoder in STANDBY
 
 unsigned long returnToStandbyAt = 0;
 unsigned long lastStopSentAt = 0;
@@ -84,6 +95,10 @@ unsigned long lastInputTime = 0;   // last input/screen change; drives the idle 
 bool displayBlank = false;         // true = screensaver running; any input restores the UI
 unsigned long lastSaverFrame = 0;
 int saverStep = 0;
+// The text screen gets exactly one full clear when first entered (set true
+// below); a volume tick then only redraws the one line that changed, not the
+// whole panel. (The bars screen doesn't need this - see vizCanvas above.)
+bool playTextInited = false;
 
 int playVolume = 50;
 bool playSeekMode = false;   // false: encoder = volume; true: encoder = track skip
@@ -105,36 +120,45 @@ bool vuSeenReal = false;   // has this PLAY session ever seen a nonzero bar? Dec
                            // which must also count legitimate all-zero frames) - merging the two
                            // made bars and screensaver flicker on quiet frames.
 
-// --- LED stereo meters ---
-// LR: frames carry 0-63 per channel; the host only sends them while audio plays,
-// so the meters also clear when frames stop (paused/stopped) or the UI leaves PLAY.
-CRGB leds[2 * LED_STICK];
+// Stereo level meters: drawn as two columns on the visualizer screen (see
+// drawPlayVisualizer). LR: frames carry 0-63 per channel at ~30fps; if they
+// stop arriving the columns are treated as silent (same VU_TIMEOUT_MS as the
+// spectrum bars, reusing lastLrAt), no separate clear/redraw lifecycle needed.
+// ponytail: only shown alongside the bars screen, not the plain PLAY text
+// screen (the old physical LEDs were separate hardware and showed immediately);
+// move this into drawPlay() too if you want them visible the whole time.
 uint8_t lrLevel[2];
-bool ledsLit = false;
 unsigned long lastLrAt = 0;
 
-void clearMeters() {
-  if (!ledsLit) return;
-  ledsLit = false;
-  FastLED.clear();
-  FastLED.show();
+// Standard fixed-point HSV->RGB565 (hue 0-359, sat/val 0-255). Adafruit_GFX has
+// no HSV helper, and FastLED's CHSV went with the dead LED code in Phase 12 -
+// needed now for the neon per-bar hue sweep and glow brightness falloff below.
+uint16_t hsv565(uint16_t hue, uint8_t sat, uint8_t val) {
+  uint8_t region = hue / 60;
+  uint8_t remainder = (hue % 60) * 255 / 60;
+  uint8_t p = (val * (255 - sat)) / 255;
+  uint8_t q = (val * (255 - ((uint16_t)sat * remainder) / 255)) / 255;
+  uint8_t t = (val * (255 - ((uint16_t)sat * (255 - remainder)) / 255)) / 255;
+  uint8_t r, g, b;
+  switch (region) {
+    case 0: r = val; g = t;   b = p;   break;
+    case 1: r = q;   g = val; b = p;   break;
+    case 2: r = p;   g = val; b = t;   break;
+    case 3: r = p;   g = q;   b = val; break;
+    case 4: r = t;   g = p;   b = val; break;
+    default: r = val; g = p;  b = q;   break;
+  }
+  return display.color565(r, g, b);
 }
 
-void drawMeters() {
-  ledsLit = true;
-  FastLED.clear();
-  for (int ch = 0; ch < 2; ch++) {
-    int n = (lrLevel[ch] * LED_STICK + 31) / 63;   // 0-63 -> 0-8 LEDs lit
-    for (int row = 0; row < n && row < LED_STICK; row++) {
-      // Both bars grow upward. The right stick is mounted the other way round, so its
-      // pixels run top-to-bottom: pixel 8 is the top row, pixel 15 the bottom.
-      int px = ch == 0 ? row : 2 * LED_STICK - 1 - row;
-      // Smooth RGB blend from purple (bottom) to light blue (top): mixing the two
-      // colours directly gives a softer transition than stepping through hues.
-      leds[px] = blend(CRGB(150, 0, 255), CRGB(70, 190, 255), row * 255 / (LED_STICK - 1));
-    }
-  }
-  FastLED.show();
+// Purple (low) -> light blue (high) gradient, same endpoints as the old LED
+// meters, scaled by `value` (0-255) for a brighter-top/dimmer-base glow falloff.
+uint16_t meterColor(uint8_t level63, uint8_t value) {
+  int t = (int)level63 * 255 / 63;
+  uint8_t r = 150 + ((70 - 150) * t) / 255;
+  uint8_t g = (190 * t) / 255;
+  uint8_t b = 255;
+  return display.color565((r * value) / 255, (g * value) / 255, (b * value) / 255);
 }
 
 // --- Buttons: one debounced press/release tracker each ---
@@ -203,29 +227,29 @@ void printUpper(String value) {
 void drawHeader() {
   display.setRotation(displayRotation);
   display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
+  display.setTextColor(ST77XX_WHITE);
   // corner ticks
-  display.drawLine(0, 0, 4, 0, SSD1306_WHITE);
-  display.drawLine(0, 0, 0, 4, SSD1306_WHITE);
-  display.drawLine(123, 0, 127, 0, SSD1306_WHITE);
-  display.drawLine(127, 0, 127, 4, SSD1306_WHITE);
-  display.drawLine(0, 63, 4, 63, SSD1306_WHITE);
-  display.drawLine(0, 59, 0, 63, SSD1306_WHITE);
-  display.drawLine(123, 63, 127, 63, SSD1306_WHITE);
-  display.drawLine(127, 59, 127, 63, SSD1306_WHITE);
-  display.setCursor(4, 0);
+  display.drawLine(0, 0, 5, 0, ST77XX_WHITE);
+  display.drawLine(0, 0, 0, 5, ST77XX_WHITE);
+  display.drawLine(154, 0, 159, 0, ST77XX_WHITE);
+  display.drawLine(159, 0, 159, 5, ST77XX_WHITE);
+  display.drawLine(0, 127, 5, 127, ST77XX_WHITE);
+  display.drawLine(0, 122, 0, 127, ST77XX_WHITE);
+  display.drawLine(154, 127, 159, 127, ST77XX_WHITE);
+  display.drawLine(159, 122, 159, 127, ST77XX_WHITE);
+  display.setCursor(6, 2);
   display.print("CD PLAYER");
-  display.drawLine(6, 10, 121, 10, SSD1306_WHITE);
+  display.drawLine(8, 13, 151, 13, ST77XX_WHITE);
 }
 
 void drawStopping() {
   uiState = UI_STOPPING;
+  playTextInited = false;
   if (!displayOk) return;
-  display.clearDisplay();
+  display.fillScreen(ST77XX_BLACK);
   drawHeader();
-  display.setCursor(2, 20);
+  display.setCursor(4, 40);
   display.print("STOPPING...");
-  display.display();
 }
 
 void drawStandby() {
@@ -233,47 +257,53 @@ void drawStandby() {
   returnToStandbyAt = 0;
   lastInputTime = millis();
   displayBlank = false;
+  playTextInited = false;
   if (!displayOk) return;
-  display.clearDisplay();
+  display.fillScreen(ST77XX_BLACK);
   drawHeader();
-  display.setCursor(2, 25);
+  display.setCursor(4, 40);
   display.print("STANDBY // READY");
-  display.setCursor(2, 40);
+  display.setCursor(4, 58);
   display.print("INSERT DISC");
-  display.display();
 }
 
 void drawDisconnected() {
   uiState = UI_DISCONNECTED;
   returnToStandbyAt = 0;
   displayBlank = false;
+  playTextInited = false;
   if (!displayOk) return;
-  display.clearDisplay();
+  display.fillScreen(ST77XX_BLACK);
   drawHeader();
-  display.setCursor(2, 25);
+  display.setCursor(4, 40);
   display.print("DISCONNECTED // LINK");
-  display.setCursor(2, 40);
+  display.setCursor(4, 58);
   display.print("CHECK USB");
-  display.display();
 }
 
-// Full-width spectrum: 64 thin bars (1px wide, 2px pitch) with a peak cap on each that jumps to
-// the bar's highest point, hangs briefly, then falls under gravity until the bar catches it.
-// No header. Falls back to drawPlay() once VU: frames stop (see VU_TIMEOUT_MS in loop()).
+// Spectrum bars (left) + stereo L/R level meters (right columns). 64 thin bars
+// (1px wide, 2px pitch) with a peak cap on each that jumps to the bar's
+// highest point, hangs briefly, then falls under gravity until the bar catches
+// it; the meter columns use the old LEDs' purple->light-blue gradient. No
+// header. Falls back to drawPlay() once VU: frames stop (see VU_TIMEOUT_MS).
 void drawPlayVisualizer() {
   uiState = UI_PLAY;
   returnToStandbyAt = 0;
   if (!displayOk) return;
-  display.clearDisplay();
+  playTextInited = false;
   const int maxH = SCREEN_HEIGHT - VU_TOP_MARGIN;
-  const int pitch = SCREEN_WIDTH / VU_BARS;
+  const int pitch = 2;
   unsigned long now = millis();
   float dt = min((now - lastVizAt) / 1000.0f, 0.1f);
   lastVizAt = now;
   float k = 1.0f - expf(-dt / BAR_RELEASE_S);
+  // Composed entirely in RAM (vizCanvas), so clearing + redrawing everything
+  // every frame is free, unlike on the live panel - no stray-pixel bookkeeping
+  // needed, and nothing is ever visible here until the one blit below.
+  vizCanvas.fillScreen(ST77XX_BLACK);
   for (int i = 0; i < VU_BARS; i++) {
     float t = vuLevel[i] * maxH / 63.0f;
-    barH[i] = t > barH[i] ? t : barH[i] + (t - barH[i]) * k;
+    barH[i] += (t - barH[i]) * k;   // symmetric ease, rise and fall alike - no more instant snap on rise
     if (barH[i] >= peakH[i]) {
       peakH[i] = barH[i];
       peakVel[i] = 0;
@@ -287,10 +317,48 @@ void drawPlayVisualizer() {
     }
     int h = (int)(barH[i] + 0.5f);
     int x = i * pitch;
-    if (h > 0) display.drawFastVLine(x, SCREEN_HEIGHT - h, h, SSD1306_WHITE);
-    if (peakH[i] >= 1) display.drawPixel(x, SCREEN_HEIGHT - (int)(peakH[i] + 0.5f) - 2, SSD1306_WHITE);   // 1px gap above the bar
+    // Neon hue sweep across the 64 bands: magenta (bass, i=0) -> blue -> cyan
+    // (treble, i=63), matching the meters' purple->blue family.
+    uint16_t hue = 320 - (i * 130) / (VU_BARS - 1);
+    if (h > 0) {
+      // Vertical "tube glow": brightest at the top of the lit bar, fading
+      // toward its base - per-pixel instead of one flat drawFastVLine, still
+      // O(h) and RAM-only, so cheap even at 64 bars/frame.
+      for (int ry = 0; ry < h; ry++) {
+        uint8_t val = 255 - (h > 1 ? (ry * 140) / (h - 1) : 0);
+        vizCanvas.drawPixel(x, SCREEN_HEIGHT - h + ry, hsv565(hue, 255, val));
+      }
+      // Horizontal halo bleed into the always-empty 1px gap column, scaled by
+      // this bar's height - gives the glow real spread with no blur math.
+      uint8_t glowVal = (uint8_t)(h * 160L / maxH);
+      if (glowVal > 0) vizCanvas.drawFastVLine(x + 1, SCREEN_HEIGHT - h, h, hsv565(hue, 180, glowVal));
+    }
+    if (peakH[i] >= 1) vizCanvas.drawPixel(x, SCREEN_HEIGHT - (int)(peakH[i] + 0.5f) - 2, ST77XX_WHITE);
   }
-  display.display();
+
+  if ((long)(millis() - lastLrAt) >= VU_TIMEOUT_MS) { lrLevel[0] = 0; lrLevel[1] = 0; }
+  int lx = SCREEN_WIDTH - METER_BLOCK, rx = lx + METER_W + METER_GAP;
+  for (int ch = 0; ch < 2; ch++) {
+    int h = lrLevel[ch] * maxH / 63;
+    if (h <= 0) continue;
+    int x = ch == 0 ? lx : rx;
+    // Same brighter-top/dimmer-base glow falloff as the bars, plus a regular
+    // gap every few rows so the fill reads as stacked LED blocks, not one
+    // smooth bar - closer to the physical LED sticks this screen replaced.
+    for (int ry = 0; ry < h; ry++) {
+      if (ry % (SEGMENT_LIT_H + SEGMENT_GAP_H) >= SEGMENT_LIT_H) continue;
+      uint8_t val = 255 - (h > 1 ? (ry * 140) / (h - 1) : 0);
+      vizCanvas.drawFastHLine(x, SCREEN_HEIGHT - h + ry, METER_W, meterColor(lrLevel[ch], val));
+    }
+  }
+  // One address-window + one continuous burst to the real panel - the only
+  // point this frame becomes visible, and always as a complete image.
+  display.drawRGBBitmap(0, 0, vizCanvas.getBuffer(), SCREEN_WIDTH, SCREEN_HEIGHT);
+}
+
+// Erases just one text row (so a volume tick redraws one line, not the whole screen).
+void clearLine(int y) {
+  display.fillRect(0, y - 2, SCREEN_WIDTH, 12, ST77XX_BLACK);
 }
 
 void drawPlay() {
@@ -298,13 +366,26 @@ void drawPlay() {
   returnToStandbyAt = 0;
   lastInputTime = millis();   // fresh content gets a full IDLE_BLANK_MS before any screensaver
   if (!displayOk) return;
-  display.clearDisplay();
-  drawHeader();
-  display.setCursor(2, 16);
+  // One full clear+header on first entry to this screen; every call (first
+  // time or not) only erases+redraws the four lines below, never the whole
+  // panel - a volume tick used to call this on every detent and flash the
+  // entire screen each time.
+  if (!playTextInited) {
+    display.fillScreen(ST77XX_BLACK);
+    drawHeader();
+    playTextInited = true;
+  }
+  // No outer startWrite()/endWrite() here: fillRect()/print() each manage their
+  // own SPI transaction internally (see Adafruit_SPITFT::startWrite - it's not
+  // reentrant), so wrapping them again nests transactions and hangs the task.
+  clearLine(28);
+  display.setCursor(4, 28);
   printUpper(line1);
-  display.setCursor(2, 30);
+  clearLine(44);
+  display.setCursor(4, 44);
   printUpper(line2);
-  display.setCursor(2, 44);
+  clearLine(64);
+  display.setCursor(4, 64);
   if (playSeekMode) {
     display.print("TURN // SKIP TRACK");
   } else {
@@ -312,10 +393,10 @@ void drawPlay() {
     display.print(playVolume);
     display.print("%");
   }
-  display.setCursor(2, 56);
+  clearLine(80);
+  display.setCursor(4, 80);
   display.print("CLICK // ");
   display.print(playSeekMode ? "VOL MODE" : "SKIP MODE");
-  display.display();
 }
 
 // 24-step sine table x64: sin(i*15deg)*64. Drives the disc screensaver.
@@ -327,39 +408,39 @@ const int8_t SIN24[24] = {
 // Spinning-disc screensaver frame.
 void drawDiscSaver(int step) {
   if (!displayOk) return;
-  const int cx = 64, cy = 32, R = 30;
-  display.clearDisplay();
-  display.fillCircle(cx, cy, R, SSD1306_WHITE);                 // vinyl body
+  const int cx = 80, cy = 64, R = 45;
+  // No per-frame fillScreen(): the area outside the circle is static background,
+  // cleared once when the screensaver starts (see loop()); the solid white
+  // circle below already overwrites the previous frame's grooves on its own.
+  display.fillCircle(cx, cy, R, ST77XX_WHITE);                 // vinyl body
 
   for (int cl = 0; cl < 2; cl++) {                              // 2 groove clusters, 180 apart
     int base = step + cl * 12;
-    for (int g = 0; g < 3; g++) {                               // 3 nested "sound wave" grooves
+    for (int g = 0; g < 4; g++) {                               // nested "sound wave" grooves
       for (int t = 0; t < 3; t++) {                             // 3px-thick stroke
-        int r = 16 + g * 5 + t;
-        int px = -100, py = -100;
+        int r = 22 + g * 6 + t;
+        int px = -200, py = -200;
         for (int a = 0; a <= 4; a++) {                          // ~60deg arc, 4 chords
           int i = (base + a) % 24;
           int x = cx + r * SIN24[(i + 6) % 24] / 64;
           int y = cy + r * SIN24[i] / 64;
-          if (px > -100) display.drawLine(px, py, x, y, SSD1306_BLACK);
+          if (px > -200) display.drawLine(px, py, x, y, ST77XX_BLACK);
           px = x; py = y;
         }
       }
     }
   }
 
-  display.fillCircle(cx, cy, 13, SSD1306_BLACK);                // concentric label
-  display.fillCircle(cx, cy, 11, SSD1306_WHITE);
-  display.fillCircle(cx, cy, 8,  SSD1306_BLACK);
-  display.fillCircle(cx, cy, 5,  SSD1306_WHITE);
-  display.fillCircle(cx, cy, 2,  SSD1306_BLACK);                // center hole
-  display.display();
+  display.fillCircle(cx, cy, 18, ST77XX_BLACK);                 // concentric label
+  display.fillCircle(cx, cy, 15, ST77XX_WHITE);
+  display.fillCircle(cx, cy, 11, ST77XX_BLACK);
+  display.fillCircle(cx, cy, 7,  ST77XX_WHITE);
+  display.fillCircle(cx, cy, 3,  ST77XX_BLACK);                 // center hole
 }
 
 // Redraws the real UI over a running screensaver. True if it woke the screen.
 bool wakeDisplay() {
   if (!displayBlank || !displayOk) return false;
-  display.ssd1306_command(0xAF);
   displayBlank = false;
   switch (uiState) {
     case UI_STOPPING: drawStopping(); break;
@@ -380,21 +461,19 @@ size_t otaSize = 0, otaDone = 0;
 
 void drawOtaProgress(int pct) {
   if (!displayOk) return;
-  display.clearDisplay();
+  display.fillScreen(ST77XX_BLACK);
   drawHeader();
-  display.setCursor(2, 18);
+  display.setCursor(4, 30);
   display.print("UPDATING FIRMWARE");
-  display.drawRect(4, 32, 120, 10, SSD1306_WHITE);
-  display.fillRect(6, 34, (116 * pct) / 100, 6, SSD1306_WHITE);
-  display.setCursor(2, 50);
+  display.drawRect(8, 55, 144, 16, ST77XX_WHITE);
+  display.fillRect(10, 57, (140 * pct) / 100, 12, ST77XX_WHITE);
+  display.setCursor(4, 80);
   display.print("DO NOT POWER OFF");
-  display.display();
 }
 
 void otaAbort(const char* why) {
   Update.abort();
   otaActive = false;
-  clearMeters();
   Serial.print("OTA:ERR ");
   Serial.println(why);
   drawStandby();
@@ -409,8 +488,7 @@ void handleOta(const String& msg) {
     otaSize = msg.substring(10, bar).toInt();
     String md5 = msg.substring(bar + 1);
     if (bar < 0 || otaSize == 0 || md5.length() != 32) { Serial.println("OTA:ERR bad request"); return; }
-    if (displayBlank) { display.ssd1306_command(0xAF); displayBlank = false; }
-    clearMeters();
+    displayBlank = false;
     if (!Update.begin(otaSize)) { Serial.println("OTA:ERR no space"); return; }
     Update.setMD5(md5.c_str());
     otaActive = true;
@@ -486,14 +564,14 @@ void parseMessage(String msg) {
   }
 
   if (msg.startsWith("LR:")) {
-    // ~15x/sec like VU: no wake, no echo, and it does not count as user activity.
+    // ~30x/sec like VU: no wake, no echo, and it does not count as user activity.
+    // Just stores the levels - drawPlayVisualizer()'s own 30fps loop paints them.
     lastMsgTime = millis();
     int comma = msg.indexOf(',');
     if (comma > 3) {
       lrLevel[0] = (uint8_t)constrain(msg.substring(3, comma).toInt(), 0, 63);
       lrLevel[1] = (uint8_t)constrain(msg.substring(comma + 1).toInt(), 0, 63);
       lastLrAt = millis();
-      if (uiState == UI_PLAY) drawMeters();
     }
     return;
   }
@@ -607,7 +685,7 @@ void handleEncoderClick() {
 void handleEncoder(int dir) {
   if (inputWakesOnly()) return;
   if (uiState == UI_STANDBY) {
-    displayRotation = dir > 0 ? 2 : 0;
+    displayRotation = dir > 0 ? 3 : 1;
     drawStandby();
   } else if (uiState == UI_PLAY) {
     vuSuppressUntil = millis() + VU_RESUME_DELAY_MS;
@@ -623,12 +701,10 @@ void handleEncoder(int dir) {
 }
 
 void setup() {
-  setCpuFrequencyMhz(160);  // 240 -> 160: about half the CPU power, plenty for I2C at 400kHz
+  setCpuFrequencyMhz(160);
   Serial.setRxBufferSize(1024);   // a 64-value VU: frame is ~200 bytes; the 256-byte default overflows
   Serial.begin(115200);
   esp_task_wdt_add(NULL);
-  Wire.begin(21, 22);
-  Wire.setClock(400000);   // 800kHz left a stuck column on the OLED
   pinMode(BTN_STOP_PIN, INPUT_PULLUP);
   pinMode(BTN_HOME_PIN, INPUT_PULLUP);
   pinMode(BTN_PLAYPAUSE_PIN, INPUT_PULLUP);
@@ -638,19 +714,12 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(ENC_CLK_PIN), encoderISR, CHANGE);
   attachInterrupt(digitalPinToInterrupt(ENC_DT_PIN), encoderISR, CHANGE);
 
-  FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, 2 * LED_STICK);
-  FastLED.setBrightness(LED_BRIGHTNESS);
-  FastLED.setDither(BINARY_DITHER);   // at this brightness the blend only exists via temporal dithering
-  FastLED.setMaxPowerInVoltsAndMilliamps(5, LED_MAX_MA);
-  FastLED.clear(true);
-
-  displayOk = display.begin(SSD1306_SWITCHCAPVCC, I2C_ADDRESS);
-  if (displayOk) {
-    Serial.println("Display OK");
-  } else {
-    Serial.println("Display FAILED");
-    delay(3000);
-  }
+  display.initR(INITR_BLACKTAB);   // try INITR_GREENTAB if colors/offset look wrong on your panel
+  // 27MHz caused an intermittent power-on brownout loop on this board (already
+  // marginal from an earlier wiring short) - back to the library's own default.
+  display.setSPISpeed(16000000);
+  displayOk = true;
+  Serial.println("Display OK");
 
   drawStandby();
   lastMsgTime = millis();
@@ -663,7 +732,7 @@ void loop() {
 
   if (returnToStandbyAt != 0 && (long)(millis() - returnToStandbyAt) >= 0) drawStandby();
 
-  // Mid-update the OLED belongs to the progress bar; give up if the host goes silent.
+  // Mid-update the screen belongs to the progress bar; give up if the host goes silent.
   if (otaActive) {
     if ((long)(millis() - lastMsgTime) >= 15000) otaAbort("timeout");
     delay(2);
@@ -684,13 +753,6 @@ void loop() {
   if (btnReleased(homeBtn)) handleHomeButton();
   if (btnReleased(playBtn, &held)) handlePlayPauseButton(held >= LONG_PRESS_MS);
 
-  // Refresh every loop while lit: FastLED's temporal dithering only blends the dim
-  // colours if show() runs far more often than the ~15fps LR: frames.
-  if (ledsLit) FastLED.show();
-
-  // Meters go dark when LR: frames stop (paused/stopped) or the UI leaves PLAY.
-  if (ledsLit && (uiState != UI_PLAY || (long)(millis() - lastLrAt) >= VU_TIMEOUT_MS)) clearMeters();
-
   // Host stopped sending VU: (paused/stopped): back to the text screen.
   if (visualizerActive && (long)(millis() - lastVuAt) >= VU_TIMEOUT_MS) {
     visualizerActive = false;
@@ -704,6 +766,8 @@ void loop() {
     displayBlank = true;
     saverStep = 0;
     lastSaverFrame = 0;
+    playTextInited = false;
+    if (displayOk) display.fillScreen(ST77XX_BLACK);   // one-time clear; drawDiscSaver() never clears per-frame
   }
   if (displayBlank && displayOk && (long)(millis() - lastSaverFrame) >= SAVER_FRAME_MS) {
     lastSaverFrame = millis();
