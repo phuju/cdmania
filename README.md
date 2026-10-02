@@ -3,8 +3,8 @@
 Companion for a slot-load CD drive (Panasonic UJ8C1 via JMS567 USB-SATA) with an ESP32 front panel.
 
 - Insert a disc: it auto-plays (mpv). STOP is SCSI stop-only; the drive stays locked, lift the disc out by hand.
-- PLAY/PAUSE, encoder volume and track skip, track number and CD-Text title on the OLED.
-- 64-bar OLED spectrum visualizer with falling peak caps; stereo WS2812B LED level meters.
+- PLAY/PAUSE, encoder volume and track skip, track number and CD-Text title on the TFT.
+- 64-bar neon spectrum visualizer with falling peak caps, plus two segmented stereo level meters, all on-screen.
 
 ## Install (Debian / Raspberry Pi OS)
 ```
@@ -16,12 +16,12 @@ cdmania pi-dac     # Raspberry Pi DAC+ hat only: enables the audio overlay (then
 Log out and in once after `setup` so the new groups apply. `cdmania path` shows where the code and `firmware/` live.
 
 ## ESP32 firmware
-Board: ESP32 WROOM-32 DevKit. `cdmania flash` does all of this; manual equivalent (libraries: Adafruit SSD1306 + GFX, FastLED):
+Board: ESP32 WROOM-32 DevKit, 1.8" ST7735R TFT (160x128, SPI). `cdmania flash` does all of this; manual equivalent (libraries: Adafruit ST7735 and ST7789 Library + GFX):
 ```
 arduino-cli compile --fqbn esp32:esp32:esp32 firmware/CDPlayer
 arduino-cli upload  -p /dev/ttyUSB0 --fqbn esp32:esp32:esp32 firmware/CDPlayer
 ```
-Pins: OLED SDA21/SCL22; STOP 14, HOME 13, PLAY/PAUSE 15; encoder CLK32/DT33/SW4; LED data GPIO18.
+Pins: TFT CS5, DC16 (RX2), RST17 (TX2), SPI MOSI23/SCK18; STOP 14, HOME 13, PLAY/PAUSE 15; encoder CLK32/DT33/SW4.
 
 ## Serial protocol (115200)
 Firmware to host: `STOP`, `PLAY_BUTTON`, `NEXT`, `PREV`, `POT:<0-100>`.

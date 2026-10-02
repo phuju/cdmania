@@ -54,7 +54,7 @@ function flashFromSource(port) {
   const sketch = path.join(root, "firmware", "CDPlayer");
   cli("core", "update-index");
   cli("core", "install", "esp32:esp32");
-  cli("lib", "install", "Adafruit SSD1306", "Adafruit GFX Library", "FastLED");
+  cli("lib", "install", "Adafruit ST7735 and ST7789 Library", "Adafruit GFX Library");
   if (cli("compile", "--fqbn", FQBN, sketch)) cli("upload", "-p", port, "--fqbn", FQBN, sketch);
 }
 
